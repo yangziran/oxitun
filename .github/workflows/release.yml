@@ -1,0 +1,80 @@
+name: Release
+on:
+  push:
+    tags:
+      - 'v*' # 当推送形如 v1.0.0 的 tag 时自动触发构建
+
+jobs:
+  build-and-release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            cli_name: oxitun-cli
+            cli_asset: oxitun-cli-macos
+          - os: ubuntu-22.04
+            cli_name: oxitun-cli
+            cli_asset: oxitun-cli-linux
+          - os: windows-latest
+            cli_name: oxitun-cli.exe
+            cli_asset: oxitun-cli-windows.exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies (Ubuntu only)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm install
+
+      # ==============================
+      # 1. 编译独立的服务端 CLI
+      # ==============================
+      - name: Build CLI
+        run: cargo build -p oxitun-cli --release
+
+      - name: Rename CLI binary
+        shell: bash
+        run: cp target/release/${{ matrix.cli_name }} ${{ matrix.cli_asset }}
+
+      # ==============================
+      # 2. 编译并打包 Tauri 桌面端
+      # ==============================
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }} # Tauri Action 会自动将安装包传到此 Tag 的 Release 中
+          releaseName: 'OxiTun ${{ github.ref_name }}'
+          releaseBody: 'OxiTun 发布版本'
+          releaseDraft: false
+          prerelease: false
+          projectPath: apps/desktop
+
+      # ==============================
+      # 3. 将 CLI 附加到同一个 Release 中
+      # ==============================
+      - name: Upload CLI to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.cli_asset }}
+          # softprops 会自动匹配当前的 Tag，并将 CLI 塞进 Tauri 刚建好的同一个 Release 里
