@@ -1,0 +1,22 @@
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Rust & Cargo
+target/
+Cargo.lock
+
+# Tauri
+apps/desktop/src-tauri/target/
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

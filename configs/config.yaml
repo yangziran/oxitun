@@ -1,0 +1,39 @@
+# OxiTun 配置文件示例 (Example Configuration)
+
+general:
+  auto_connect: false             # 是否在启动时自动连接代理
+  auto_startup: false             # 是否开机自启
+  auto_set_system_proxy: false    # 是否自动设置系统代理
+  pin_window: false               # 是否置顶窗口
+  chnroute_url: "https://cdn.jsdelivr.net/gh/misakaio/chnroutes2@master/chnroutes.txt" # 智能路由大陆 IP 列表更新地址
+  chnroute_update_interval_hours: 24.0 # 路由表自动更新间隔（小时）
+
+servers:
+  - name: "myserver"              # 服务器自定义名称
+    host: "127.0.0.1"             # SSH 服务器地址
+    port: 2222                    # SSH 端口
+    user: "root"                  # SSH 登录用户名
+    auth_type: "password"         # 认证方式：'password' 或 'key'
+    password: "your_password"     # 登录密码（保存后会自动被加密）
+    key_path: "~/.ssh/id_rsa"     # 密钥路径（若 auth_type 为 key）
+    encrypted: false              # 密码是否已被加密
+    keep_alive_interval: 15       # SSH 保活心跳间隔（秒）
+    reconnect_attempts: 3         # 断线重连次数
+    timeout_seconds: 15           # 连接超时时间（秒）
+
+tunnels:
+  - name: "SOCKS5 Proxy"          # 隧道名称
+    server_names: ["myserver"]    # 该隧道绑定的服务器名称列表
+    type: "Dynamic"        # 隧道类型：'Dynamic' (SOCKS5 代理), 'Local' (本地端口转发), 'Remote' (远程反向代理)
+    port: 1080                   # 监听的本地端口
+    remote_addr: null             # 目标地址（仅 Local 或 Remote 模式需要，格式为 host:port）
+    share_on_lan: false           # 是否允许局域网其他设备连接
+
+routing:
+  mode: "Global"                  # 路由模式：'Global' (全局), 'Whitelist' (白名单/绕过大陆), 'Blacklist' (黑名单/仅代理名单内), 'Direct' (直连)
+  bypass_lan: true                # 是否绕过局域网/私有 IP 地址 (开启后将自动直连 localhost, 127.0.0.1, 192.168.x.x, 10.x.x.x 等所有本机与 IPv4/IPv6 内网地址)
+  whitelist:                      # 强制走代理的域名白名单
+    - "google.com"
+    - "youtube.com"
+  blacklist:                      # 强制直连的域名黑名单
+    - "ads.example.com"

@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/cli",
+    "apps/desktop/src-tauri"
+]
+resolver = "2"
+
+[profile.dev]
+# Fast local compilation
+debug = true
+
+[profile.dev.package.oxitun-core]
+opt-level = 3
+
+[profile.dev.package."*"]
+# Max optimization for crypto/network dependencies
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

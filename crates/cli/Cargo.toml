@@ -1,0 +1,12 @@
+[package]
+name = "oxitun-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+oxitun-core = { path = "../core" }
+tokio = { version = "1.53.1", features = ["full"] }
+clap = { version = "4.5.1", features = ["derive"] }
+log = "0.4.34"
+env_logger = "0.11.11"
+anyhow = "1.0.104"
