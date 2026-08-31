@@ -300,9 +300,11 @@ pub fn run() {
                 app.on_menu_event(|app_handle, event| {
                     if event.id() == "preferences" {
                         if let Some(window) = app_handle.get_webview_window("main") {
-                            let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Regular);
                             #[cfg(target_os = "macos")]
-                            let _ = app_handle.show();
+                            {
+                                let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Regular);
+                                let _ = app_handle.show();
+                            }
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
@@ -348,9 +350,11 @@ pub fn run() {
                             }
                             "preferences" => {
                                 if let Some(window) = app_handle.get_webview_window("main") {
-                                    let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Regular);
                                     #[cfg(target_os = "macos")]
-                                    let _ = app_handle.show();
+                                    {
+                                        let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Regular);
+                                        let _ = app_handle.show();
+                                    }
                                     let _ = window.show();
                                     let _ = window.set_focus();
                                     let w = window.clone();
@@ -436,6 +440,7 @@ pub fn run() {
                     {
                         let app = tray.app_handle();
                         if let Some(window) = app.get_webview_window("main") {
+                            #[cfg(target_os = "macos")]
                             let _ = app.show(); 
                             let _ = window.show();
                             let _ = window.set_focus();
@@ -466,6 +471,7 @@ pub fn run() {
                 window.on_window_event(move |event| match event {
                     tauri::WindowEvent::CloseRequested { api, .. } => {
                         window_clone.hide().unwrap();
+                        #[cfg(target_os = "macos")]
                         let _ = window_clone.app_handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
                         api.prevent_close();
                     }
