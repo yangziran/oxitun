@@ -13,14 +13,17 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            cli_name: oxitun-cli
-            cli_asset: oxitun-cli-macos
+            target: x86_64-apple-darwin
+            cli_asset: oxitun-cli-macos-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cli_asset: oxitun-cli-macos-arm64
           - os: ubuntu-22.04
-            cli_name: oxitun-cli
-            cli_asset: oxitun-cli-linux
+            target: x86_64-unknown-linux-gnu
+            cli_asset: oxitun-cli-linux-amd64
           - os: windows-latest
-            cli_name: oxitun-cli.exe
-            cli_asset: oxitun-cli-windows.exe
+            target: x86_64-pc-windows-msvc
+            cli_asset: oxitun-cli-windows-amd64.exe
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -34,6 +37,8 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Install dependencies (Ubuntu only)
         if: matrix.os == 'ubuntu-22.04'
@@ -49,11 +54,16 @@ jobs:
       # 1. 编译独立的服务端 CLI
       # ==============================
       - name: Build CLI
-        run: cargo build -p oxitun-cli --release
+        run: cargo build -p oxitun-cli --release --target ${{ matrix.target }}
 
       - name: Rename CLI binary
         shell: bash
-        run: cp target/release/${{ matrix.cli_name }} ${{ matrix.cli_asset }}
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/oxitun-cli.exe ${{ matrix.cli_asset }}
+          else
+            cp target/${{ matrix.target }}/release/oxitun-cli ${{ matrix.cli_asset }}
+          fi
 
       # ==============================
       # 2. 编译并打包 Tauri 桌面端
@@ -63,6 +73,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          args: --target ${{ matrix.target }}
           tagName: ${{ github.ref_name }} # Tauri Action 会自动将安装包传到此 Tag 的 Release 中
           releaseName: 'OxiTun ${{ github.ref_name }}'
           releaseBody: 'OxiTun 发布版本'
