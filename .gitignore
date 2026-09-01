@@ -6,7 +6,6 @@ dist-ssr/
 
 # Rust & Cargo
 target/
-Cargo.lock
 
 # Tauri
 apps/desktop/src-tauri/target/

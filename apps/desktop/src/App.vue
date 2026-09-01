@@ -29,7 +29,7 @@ interface ServerConfig {
 interface TunnelConfig {
   name: string;
   server_names: string[];
-  type: "local" | "dynamic";
+  type: "local" | "dynamic" | "remote" | "dns" | "dns_dot" | "dns_doh";
   port: number;
   remote_addr?: string;
   share_on_lan: boolean;
@@ -323,8 +323,12 @@ function removeServer(index: number) {
           <div class="mac-row" style="border-bottom: none; padding-bottom: 0; padding-top: 8px;">
             <div class="control" style="width: 100%; display: flex; gap: 8px; align-items: center; justify-content: center;">
               <select v-model="config.tunnels[0].type" @change="saveConfig" style="width: 120px; flex-shrink: 0; text-align: center;">
-                <option value="dynamic">SOCKS5 代理</option>
-                <option value="local">本地转发</option>
+                <option value="dynamic">动态代理 (SOCKS5)</option>
+                <option value="local">本地端口转发 (Local)</option>
+                <option value="remote">远程反向转发 (Remote)</option>
+                <option value="dns">DNS 代理 (UDP 转 TCP)</option>
+                <option value="dns_dot">DNS 代理 (DoT)</option>
+                <option value="dns_doh">DNS 代理 (DoH)</option>
               </select>
               
               <select :key="config.tunnels[0].server_names[0]" v-model="config.tunnels[0].server_names[0]" @change="saveConfig" style="width: 200px; flex-shrink: 0;">
@@ -337,14 +341,14 @@ function removeServer(index: number) {
             </div>
           </div>
           
-          <div class="mac-row" v-if="config.tunnels[0].type === 'local'" style="border-bottom: none; padding-top: 12px; padding-bottom: 8px;">
+          <div class="mac-row" v-if="['local', 'remote', 'dns', 'dns_dot', 'dns_doh'].includes(config.tunnels[0].type)" style="border-bottom: none; padding-top: 12px; padding-bottom: 8px;">
             <div class="control" style="width: 100%; display: flex; gap: 8px; align-items: center; justify-content: center;">
-              <span style="font-size: 13px; color: #1d1d1f; white-space: nowrap;">目标地址:</span>
+              <span style="font-size: 13px; color: #1d1d1f; white-space: nowrap;">{{ ['dns', 'dns_dot', 'dns_doh'].includes(config.tunnels[0].type) ? '上游 DNS:' : '目标地址:' }}</span>
               <input v-model="config.tunnels[0].remote_addr" placeholder="例如: 192.168.1.1:80" @blur="saveConfig" style="width: 200px; text-align: center;" />
             </div>
           </div>
           
-          <div class="mac-row" v-else style="padding-top: 12px; padding-bottom: 8px;">
+          <div class="mac-row" style="padding-top: 8px; padding-bottom: 8px;">
             <div class="control" style="justify-content: center; gap: 8px; width: 100%; align-items: center;">
               <input type="checkbox" v-model="config.tunnels[0].share_on_lan" @change="saveConfig" style="margin: 0;" />
               <span style="font-size: 13px; color: #1d1d1f;">允许局域网连接</span>
@@ -369,8 +373,12 @@ function removeServer(index: number) {
                 <div class="mac-row" style="border-bottom: none; padding-bottom: 0; padding-top: 4px;">
                   <div class="control" style="width: 100%; display: flex; gap: 8px; align-items: center; justify-content: center;">
                     <select v-model="tun.type" @change="saveConfig" style="width: 120px; flex-shrink: 0; text-align: center;">
-                      <option value="dynamic">SOCKS5 代理</option>
-                      <option value="local">本地转发</option>
+                      <option value="dynamic">动态代理 (SOCKS5)</option>
+                      <option value="local">本地端口转发 (Local)</option>
+                      <option value="remote">远程反向转发 (Remote)</option>
+                      <option value="dns">DNS 代理 (UDP 转 TCP)</option>
+                      <option value="dns_dot">DNS 代理 (DoT)</option>
+                      <option value="dns_doh">DNS 代理 (DoH)</option>
                     </select>
                     
                     <select :key="tun.server_names && tun.server_names.length > 0 ? tun.server_names[0] : 'empty'" :value="tun.server_names && tun.server_names.length > 0 ? tun.server_names[0] : ''" @change="(e: any) => { tun.server_names = e.target.value ? [e.target.value] : []; saveConfig(); }" style="width: 200px; flex-shrink: 0;">
@@ -384,14 +392,14 @@ function removeServer(index: number) {
                   </div>
                 </div>
                 
-                <div class="mac-row" v-if="tun.type === 'local'" style="border-bottom: none; padding-top: 12px; padding-bottom: 4px;">
+                <div class="mac-row" v-if="['local', 'remote', 'dns', 'dns_dot', 'dns_doh'].includes(tun.type)" style="border-bottom: none; padding-top: 12px; padding-bottom: 4px;">
                   <div class="control" style="width: 100%; display: flex; gap: 8px; align-items: center; justify-content: center;">
-                    <span style="font-size: 13px; color: #1d1d1f; white-space: nowrap;">目标地址:</span>
-                    <input v-model="tun.remote_addr" placeholder="例如: 192.168.1.1:80" @blur="saveConfig" style="width: 200px; text-align: center;" />
+                    <span style="font-size: 13px; color: #1d1d1f; white-space: nowrap;">{{ ['dns', 'dns_dot', 'dns_doh'].includes(tun.type) ? '上游 DNS:' : '目标地址:' }}</span>
+                    <input v-model="tun.remote_addr" :placeholder="['dns_dot', 'dns_doh'].includes(tun.type) ? '例如: dot.pub 或 doh.pub:443' : (tun.type === 'dns' ? '例如: 8.8.8.8:53' : '例如: 192.168.1.1:80')" @blur="saveConfig" style="width: 200px; text-align: center;" />
                   </div>
                 </div>
                 
-                <div class="mac-row" v-else style="padding-top: 12px; padding-bottom: 4px;">
+                <div class="mac-row" style="padding-top: 8px; padding-bottom: 4px;">
                   <div class="control" style="justify-content: center; gap: 8px; width: 100%; align-items: center;">
                     <input type="checkbox" v-model="tun.share_on_lan" @change="saveConfig" style="margin: 0;" />
                     <span style="font-size: 13px; color: #1d1d1f;">允许局域网连接</span>
@@ -593,7 +601,7 @@ function removeServer(index: number) {
           </div>
           <div class="row" style="margin-top: 12px;">
             <label>路由规则订阅地址</label>
-            <input v-model="config.general.chnroute_url" placeholder="URL" @change="saveConfig" />
+            <input v-model="config.general.chnroute_url" placeholder="例如: https://.../chnroutes.txt" @change="saveConfig" />
           </div>
           <div class="row" style="margin-top: 12px;">
             <label>订阅更新频率</label>

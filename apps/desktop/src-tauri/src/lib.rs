@@ -36,12 +36,12 @@ fn update_tray_menu(app: &AppHandle) {
         
         let mut builder = MenuBuilder::new(&app_handle);
         
-        // Proxy Status
+        // 代理状态
         builder = builder.item(&MenuItemBuilder::new(if is_running { "状态: 已开启" } else { "状态: 已关闭" }).enabled(false).build(&app_handle).unwrap());
         builder = builder.item(&MenuItemBuilder::with_id("toggle", if is_running { "关闭代理" } else { "开启代理" }).build(&app_handle).unwrap());
         builder = builder.separator();
         
-        // Servers
+        // 服务器列表
         if let Some(cfg) = config_guard.as_ref() {
             let configured_active = cfg.tunnels.first()
                 .and_then(|t| t.server_names.first())
@@ -57,7 +57,7 @@ fn update_tray_menu(app: &AppHandle) {
             }
             builder = builder.item(&server_menu.build().unwrap());
             
-            // Routing Mode
+            // 路由模式
             let mut mode_menu = SubmenuBuilder::new(&app_handle, "路由模式");
             let modes = [
                 ("global", "全局模式"),
@@ -147,13 +147,13 @@ async fn start_tunnels_internal(state: &AppState, app: &AppHandle) -> Result<(),
     let pool = Arc::new(ServerPool::new(actual_config.servers.clone()));
     let manager = Arc::new(TunnelManager::new(pool.clone(), actual_config.routing.clone(), actual_config.general.chnroute_url.clone()).await);
 
-    // Auto-updater task
+    // 路由表自动更新任务
     let update_interval = actual_config.general.chnroute_update_interval_hours;
     let url = actual_config.general.chnroute_url.clone();
     if update_interval > 0.0 {
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs((update_interval * 3600.0) as u64));
-            interval.tick().await; // skip first immediate tick
+            interval.tick().await; // 忽略首次立即执行的触发
             loop {
                 interval.tick().await;
                 log::info!("Auto-updating chnroutes...");
@@ -169,7 +169,7 @@ async fn start_tunnels_internal(state: &AppState, app: &AppHandle) -> Result<(),
         manager.add_task(handle).await;
     }
 
-    // Pre-connect check
+    // 连接前检查
     for tun_cfg in &actual_config.tunnels {
         let mut any_success = false;
         let mut last_err = String::new();
@@ -210,7 +210,7 @@ async fn start_tunnels_internal(state: &AppState, app: &AppHandle) -> Result<(),
     let mut active_guard = state.active_server.lock().await;
     *active_guard = first_server;
     
-    // Apply system proxy if needed
+    // 根据配置应用系统代理
     let mut socks_port = 1080;
     for t in &actual_config.tunnels {
         if matches!(t.tunnel_type, oxitun_core::config::TunnelType::Dynamic) {
@@ -231,7 +231,7 @@ async fn stop_tunnels_internal(state: &AppState, app: &AppHandle) {
         manager.stop_all().await;
     }
     
-    // Always disable system proxy when stopping
+    // 停止时必定关闭系统代理，防止系统无网
     let port = state.config.lock().await.as_ref().and_then(|c| c.tunnels.first()).map(|t| t.port).unwrap_or(1080);
     let _ = oxitun_core::sysproxy::set_system_proxy(false, "127.0.0.1", port);
     

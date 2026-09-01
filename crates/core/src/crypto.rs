@@ -12,7 +12,7 @@ static MASTER_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 const DEFAULT_LEGACY_KEY: &[u8; 32] = b"OxiTun_SecretKey_1234567890_ABCD";
 
 pub fn get_key_path() -> anyhow::Result<PathBuf> {
-    let mut path = dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot find config dir"))?;
+    let mut path = dirs::config_dir().ok_or_else(|| anyhow::anyhow!("找不到系统的配置目录 (Config Directory)"))?;
     path.push("OxiTun");
     fs::create_dir_all(&path)?;
     path.push("master.key");
@@ -37,16 +37,16 @@ fn init_master_key() -> [u8; 32] {
         
         // 生成强随机密钥 (向后兼容由 decrypt 函数的 fallback 机制保证)
         rand::rng().fill_bytes(&mut key);
-        log::info!("Generated new strong master key at {:?}", path);
+        log::info!("生成了全新的强主密钥并保存在 {:?}", path);
         
         let b64_str = general_purpose::STANDARD.encode(key);
         if let Err(e) = fs::write(&path, b64_str) {
-            log::error!("CRITICAL: Failed to write master key to {:?}: {}", path, e);
+            log::error!("严重错误: 无法将主密钥写入至 {:?}: {}", path, e);
         }
         return key;
     }
     
-    log::warn!("Failed to get config directory, falling back to legacy master key.");
+    log::warn!("获取配置目录失败，回退使用内置的旧版主密钥。");
     key.copy_from_slice(DEFAULT_LEGACY_KEY);
     key
 }
@@ -66,7 +66,7 @@ pub fn encrypt(plaintext: &str) -> anyhow::Result<String> {
     let nonce = Nonce::from(nonce_bytes);
     
     let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes())
-        .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
+        .map_err(|_| anyhow::anyhow!("加密过程失败"))?;
     
     let mut combined = nonce.to_vec();
     combined.extend_from_slice(&ciphertext);
@@ -80,10 +80,10 @@ pub fn decrypt(encoded: &str) -> anyhow::Result<String> {
     }
     let combined = general_purpose::STANDARD.decode(encoded)?;
     if combined.len() < 12 {
-        return Err(anyhow::anyhow!("Invalid ciphertext length"));
+        return Err(anyhow::anyhow!("密文长度无效"));
     }
     
-    let nonce_bytes: [u8; 12] = combined[..12].try_into().map_err(|_| anyhow::anyhow!("Invalid nonce format"))?;
+    let nonce_bytes: [u8; 12] = combined[..12].try_into().map_err(|_| anyhow::anyhow!("无效的 nonce 格式"))?;
     let nonce = Nonce::from(nonce_bytes);
     let ciphertext = &combined[12..];
     
@@ -103,5 +103,5 @@ pub fn decrypt(encoded: &str) -> anyhow::Result<String> {
         }
     }
     
-    Err(anyhow::anyhow!("Decryption failed with both current and legacy keys"))
+    Err(anyhow::anyhow!("使用当前密钥及历史遗留密钥均解密失败"))
 }

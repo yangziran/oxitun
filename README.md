@@ -1,29 +1,33 @@
 # OxiTun 🚀
 
-OxiTun 是一款基于 Rust 和 Tauri 构建的高性能 SSH 隧道与 SOCKS5 代理客户端。专为追求极致网络性能、低资源占用与原生体验的用户设计。它提供**桌面级 GUI 图形端**与**服务端级 Headless CLI 纯净端**，可完美部署于个人电脑、软路由及无界面的 Linux 服务器。
+OxiTun 是一款基于 Rust 和 Tauri 构建的高性能 SSH 隧道与多协议代理客户端。专为追求极致网络性能、低资源占用与原生体验的用户设计。它提供**桌面级 GUI 图形端**与**服务端级 Headless CLI 纯净端**，可完美部署于个人电脑、软路由及无界面的 Linux 服务器。
 
 ## ✨ 核心特性
 
 - **双端架构**：支持交互丰富的 Tauri/Vue 图形界面客户端，以及极简、纯净、无任何冗余依赖的 CLI 命令行服务端。
 - **极致性能**：底层采用纯 Rust (`Tokio` + `Russh`) 编写，无缝对接系统级硬件加密指令集。
-- **全栈协议支持**：完美支持 IPv4 和 IPv6 双栈网络，彻底告别单栈局限（支持 `[::1]` 规范）。
-- **智能路由分流**：内置强大的路由引擎，支持 PAC 模式（自动分流）、全局代理和直连模式，支持自定义 CIDR / 域名黑白名单，且能智能绕过局域网（Bypass LAN）。
-- **标准端口设定**：统一且规范的本地 SOCKS5 监听端口标准（`1080`），与绝大多数代理生态无缝对接。
-- **系统代理接管**：一键自动设置并恢复 macOS 等操作系统的系统级 SOCKS5 代理，退出或收到 `Ctrl+C` 中断时触发优雅清理逻辑，绝不留僵尸进程。
-- **自动重连与并发**：多路复用 SSH 会话，提供自动重连与 Keep-Alive 存活检测，彻底解决长连接掉线痛点。
+- **多维度隧道代理支持**：
+  - **SOCKS5 代理 (Dynamic Forwarding)**：标准动态代理转发，支持 IPv4 / IPv6 双栈与域名解析。
+  - **本地与远程穿透 (Local/Remote Forwarding)**：支持将远端端口映射到本地，或将本地端口反向穿透暴露给公网。
+  - **高级 DNS 隧道 (DNS Proxy)**：内置高性能 DNS 引擎（基于 Moka 缓存），支持传统 DNS over TCP，以及高安全性的 **DNS over TLS (DoT)** 和 **DNS over HTTPS (DoH)** 协议。
+- **智能网络分流引擎**：
+  - 支持 全局 (Global) / 直连 (Direct) / 白名单 (Whitelist) / 黑名单 (Blacklist) 模式。
+  - **高级规则**：内置局域网 (Bypass LAN) 自动绕行，以及基于大容量 CIDR 二分查找的大陆 IP 直连路由表 (`chnroutes`) 支持。
+- **系统代理接管**：跨平台（macOS / Windows / Linux）一键接管系统级 SOCKS5 代理与 DNS 劫持，退出时确保优雅清理，无残留配置。
+- **高可用会话池**：提供基于 Round-Robin 算法调度的多节点 SSH 代理连接池，自动重连、Keep-Alive 检测，彻底告别断线重连痛点。
 
 ## 🔒 安全与隐私 (Security)
 
-- **动态主密钥 (Dynamic Master Key)**：为了保证代码开源后的绝对安全，所有节点密码均使用本地动态生成的强密钥进行 AES-256-GCM 加密存储。
-  - **自动生成**：首次启动时，程序会通过操作系统的安全随机数发生器生成 256 位高强度密钥，保存在用户的本地应用配置目录（如 macOS 的 `~/Library/Application Support/OxiTun/master.key`）。
-  - **防源码逆向**：开源代码中不包含任何硬编码密钥，从根本上杜绝了密钥被反编译泄露的风险，并将密码加解密权限完全交还给用户。
-- **开源防呆设计**：真实配置文件名 `config.yaml` 已被严格列入 `.gitignore`。代码库内仅提供脱敏的 `config.example.yaml` 供参考，最大程度杜绝了开发者误传真实服务器 IP 和密码的事故。
+- **动态主密钥 (Dynamic Master Key)**：所有节点密码均使用本地动态生成的强随机密钥进行 AES-256-GCM 加密存储，彻底告别明文密码泄露风险。
+  - **完美向后兼容**：支持回退解密旧版配置遗留的密码。
+  - 密钥被安全地存放在系统数据目录中（如 macOS 下的 `~/.config/OxiTun/master.key`），从根源防范逆向分析。
+- **开源脱敏设计**：代码库中保留的 `configs/config.yaml` 仅作为脱敏后的样例模板供开发者参考，保护用户隐私。
 
 ## ⚡ 硬件加速与优化
 
-- **Native Crypto**：已内置 `target-cpu=native` 配置，全面激活 Apple Silicon (M1/M2/M3) Crypto 扩展或 Intel/AMD AES-NI 硬件加密加速，加解密开销降低 80% 以上。
-- **流媒体优化**：为高码率流媒体（如 YouTube 1080P/4K/8K）提供底层的多路复用与大文件传输优化，利用 OS 默认 TCP 缓冲机制取代传统 Nagle 算法，稳定跑满物理带宽。
-- **全域性能解放**：我们在 `Cargo.toml` 中强制注入了 `[profile.dev] opt-level = 3`。无论是您进行日常 Debug 开发，还是使用 `LTO` 极限编译构建 Release 产物，均能享受顶配的加解密吞吐率。
+- **Native Crypto**：内置 `target-cpu=native` 策略，激活 Apple Silicon (M1/M2/M3) Crypto 扩展或 Intel/AMD AES-NI 硬件加密加速，加解密开销降低 80% 以上。
+- **异步全双工 I/O**：重写了底层的 `BidirectionalCopy` 数据桥接模块，支持不等分片刷新机制，最大化降低代理传输的 TTFB（首字节延迟）。
+- **流媒体释放**：彻底取消 Nagle 算法 (`set_nodelay(true)`) 优化高码率流媒体（如 YouTube 4K/8K）传输瓶颈，稳定跑满物理带宽。
 
 ## 🛠️ 技术栈
 
@@ -37,7 +41,7 @@ OxiTun 是一款基于 Rust 和 Tauri 构建的高性能 SSH 隧道与 SOCKS5 �
 - `apps/desktop/` - 面向日常用户的 Tauri 客户端与 Vue 图形化前端源码。
 - `crates/core/` - OxiTun 的最强心脏：Rust 核心代理层 (涵盖网络协议栈、AES加密、系统代理挂载、智能路由引擎)。
 - `crates/cli/` - 面向硬核极客与服务器环境的极简纯命令行工具（构建物极小，不含任何前端冗余）。
-- `configs/` - 脱敏后的配置文件参考模板 (`config.example.yaml`)。
+- `configs/` - 脱敏后的配置文件参考模板 (`config.yaml`)。
 
 ## 📦 编译与运行
 

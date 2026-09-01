@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use ipnet::IpNet;
 use tokio::fs;
 
+/// 核心路由分流引擎，负责根据黑白名单及局域网/大陆IP绕行规则判断流量走向
 pub struct Router {
     config: RoutingConfig,
+    /// 缓存的 CIDR 路由规则 (start_ip, end_ip) 供二分查找
     chnroutes: Vec<(u32, u32)>,
     whitelist_cidrs: Vec<IpNet>,
     whitelist_domains: Vec<String>,
@@ -15,6 +17,7 @@ pub struct Router {
 }
 
 impl Router {
+    /// 初始化路由引擎，解析黑白名单并异步加载大陆直连路由表 (若开启)
     pub async fn new(config: RoutingConfig, chnroute_url: &str) -> Self {
         let mut whitelist_cidrs = Vec::new();
         let mut whitelist_domains = Vec::new();
@@ -63,7 +66,7 @@ impl Router {
 
         let mut lines = String::new();
         
-        // Try download
+        // 尝试从远端下载路由列表
         
         let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
         match client.get(url).send().await {
@@ -71,16 +74,16 @@ impl Router {
                 if let Ok(text) = resp.text().await {
                     lines = text;
                     let _ = fs::write(&cache_file, &lines).await;
-                    info!("Downloaded and cached latest chnroutes.txt");
+                    info!("已成功下载并缓存最新的 chnroutes.txt 路由表");
                 }
             }
             _ => {
-                // Fallback to cache
+                // 若下载失败，回退使用本地缓存
                 if let Ok(text) = fs::read_to_string(&cache_file).await {
                     lines = text;
-                    info!("Loaded chnroutes.txt from local cache");
+                    info!("从本地缓存成功加载 chnroutes.txt 路由表");
                 } else {
-                    error!("Failed to download chnroutes.txt and no cache found");
+                    error!("下载 chnroutes.txt 失败，且未找到本地缓存");
                 }
             }
         }
@@ -98,7 +101,7 @@ impl Router {
         
         routes.sort_by_key(|r| r.0);
         self.chnroutes = routes;
-        info!("Loaded {} China IP routing rules", self.chnroutes.len());
+        info!("成功加载 {} 条大陆 IP 直连路由规则", self.chnroutes.len());
     }
 
     fn match_rules(&self, host: &str, domains: &[String], cidrs: &[IpNet]) -> bool {
@@ -131,11 +134,11 @@ impl Router {
                 if in_blacklist {
                     return false;
                 }
-                // If not in blacklist, proxy it... UNLESS bypass_lan is on and it's a LAN/CN IP
+                // 若不在黑名单内则默认代理，除非启用了绕过局域网/大陆IP，并且目标为境内 IP
                 if self.config.bypass_lan {
                     if let Ok(ip) = self.resolve_and_check_bypass(host).await {
                         if ip {
-                            return false; // Direct for LAN/CN
+                            return false; // 局域网及大陆 IP 执行直连
                         }
                     }
                 }
@@ -145,19 +148,19 @@ impl Router {
     }
 
     async fn resolve_and_check_bypass(&self, host: &str) -> Result<bool, anyhow::Error> {
-        // Simple heuristic: if host is already an IP, parse it directly
-        // WARNING: NEVER use tokio::net::lookup_host here!
-        // Local DNS resolution for blocked domains (like youtube.com) will time out and cause 10+ second delays per request!
+        // 简单启发式策略：若 host 已经是 IP 格式，则直接解析判断
+        // 警告：绝对禁止在此处使用 tokio::net::lookup_host！
+        // 对被污染的域名（如 youtube.com）进行本地 DNS 解析会导致每次请求长达 10 秒以上的延迟！
         let ip = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             ip
         } else {
-            // It's a domain name. We assume it's NOT a LAN IP.
-            // If the user wants to bypass specific domains, they should use domain rules.
+            // 目标为域名，我们默认其非局域网 IP。
+            // 如果用户想让特定域名直连，应使用域名规则路由。
             return Ok(false);
         };
 
         if is_local_or_lan(ip) {
-            debug!("IP {} is Local/LAN/Multicast, bypassing proxy", ip);
+            debug!("IP {} 属于本地/局域网/多播地址，跳过代理直接连接", ip);
             return Ok(true);
         }
         
@@ -206,11 +209,11 @@ fn is_local_or_lan(ip: IpAddr) -> bool {
             let segments = ipv6.segments();
             // ::1 (Loopback)
             ipv6.is_loopback() ||
-            // fc00::/7 (Unique Local Address)
+            // fc00::/7 (唯一本地地址)
             (segments[0] & 0xfe00) == 0xfc00 ||
-            // fe80::/10 (Link-local)
+            // fe80::/10 (链路本地地址)
             (segments[0] & 0xffc0) == 0xfe80 ||
-            // Multicast (ff00::/8)
+            // 多播地址 (ff00::/8)
             (segments[0] & 0xff00) == 0xff00
         }
     }
