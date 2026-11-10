@@ -24,3 +24,12 @@ pub mod copy_bidirectional;
 
 /// DNS 代理模块，支持标准 DNS、DoT 和 DoH 查询以及本地缓存
 pub mod dns;
+
+/// known_hosts 模块，提供 SSH 主机密钥 TOFU 信任存储
+pub mod known_hosts;
+
+/// 主机密钥确认协调模块（TOFU 交互层）
+pub mod host_key;
+
+/// 可选 Prometheus 指标模块
+pub mod metrics;

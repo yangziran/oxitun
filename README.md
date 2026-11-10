@@ -13,21 +13,20 @@ OxiTun 是一款基于 Rust 和 Tauri 构建的高性能 SSH 隧道与多协议�
 - **智能网络分流引擎**：
   - 支持 全局 (Global) / 直连 (Direct) / 白名单 (Whitelist) / 黑名单 (Blacklist) 模式。
   - **高级规则**：内置局域网 (Bypass LAN) 自动绕行，以及基于大容量 CIDR 二分查找的大陆 IP 直连路由表 (`chnroutes`) 支持。
-- **系统代理接管**：跨平台（macOS / Windows / Linux）一键接管系统级 SOCKS5 代理与 DNS 劫持，退出时确保优雅清理，无残留配置。
+- **系统代理接管**：跨平台（macOS / Windows / Linux）接管系统级 SOCKS5 代理（macOS 额外支持在有 DNS 隧道时接管 DNS），**退出时自动还原到接管前的配置，不残留、不覆盖用户原有代理设置**。
 - **高可用会话池**：提供基于 Round-Robin 算法调度的多节点 SSH 代理连接池，自动重连、Keep-Alive 检测，彻底告别断线重连痛点。
 
 ## 🔒 安全与隐私 (Security)
 
 - **动态主密钥 (Dynamic Master Key)**：所有节点密码均使用本地动态生成的强随机密钥进行 AES-256-GCM 加密存储，彻底告别明文密码泄露风险。
-  - **完美向后兼容**：支持回退解密旧版配置遗留的密码。
-  - 密钥被安全地存放在系统数据目录中（如 macOS 下的 `~/.config/OxiTun/master.key`），从根源防范逆向分析。
+  - 密钥被安全地存放在系统数据目录中（macOS 下为 `~/Library/Application Support/OxiTun/master.key`），文件权限收紧为仅当前用户可读写。
 - **开源脱敏设计**：代码库中保留的 `configs/config.yaml` 仅作为脱敏后的样例模板供开发者参考，保护用户隐私。
 
 ## ⚡ 硬件加速与优化
 
-- **Native Crypto**：内置 `target-cpu=native` 策略，激活 Apple Silicon (M1/M2/M3) Crypto 扩展或 Intel/AMD AES-NI 硬件加密加速，加解密开销降低 80% 以上。
-- **异步全双工 I/O**：重写了底层的 `BidirectionalCopy` 数据桥接模块，支持不等分片刷新机制，最大化降低代理传输的 TTFB（首字节延迟）。
-- **流媒体释放**：彻底取消 Nagle 算法 (`set_nodelay(true)`) 优化高码率流媒体（如 YouTube 4K/8K）传输瓶颈，稳定跑满物理带宽。
+- **可选 Native Crypto**：提供 `target-cpu=native` 构建选项（见 `.cargo/config.toml`，默认关闭以兼容旧 CPU），可激活 Apple Silicon (M1/M2/M3) Crypto 扩展或 Intel/AMD AES-NI 硬件加密加速。
+- **异步全双工 I/O**：重写了底层的 `BidirectionalCopy` 数据桥接模块，支持不等分片刷新与半关闭传播，降低代理传输的 TTFB（首字节延迟）。
+- **流媒体释放**：取消 Nagle 算法 (`set_nodelay(true)`)，配合 TCP 缓冲调优，改善高码率流媒体传输体验。
 
 ## 🛠️ 技术栈
 
@@ -48,14 +47,42 @@ OxiTun 是一款基于 Rust 和 Tauri 构建的高性能 SSH 隧道与多协议�
 ### 准备工作
 - Node.js (推荐 v18+)
 - Rust (最新 Stable 版本)
-- macOS 系统需安装 Xcode Command Line Tools。
+- macOS 系统需安装 Xcode Command Line Tools
+
+### 方式零：Makefile 一键编译（推荐）
+
+项目根目录提供 `Makefile`，自动做版本一致性检查（`scripts/check-version.sh`）后编译：
+
+```bash
+# 当前平台 CLI（产物在 bin/oxitun-cli）
+make build-cli
+
+# 当前平台 GUI（产物在 target/release/bundle/，src-tauri 为 workspace 成员）
+make build-gui
+
+# CLI 各平台（交叉编译；Linux 用 musl 静态链接，Windows 需 MSVC 链）
+make build-cli-mac     # bin/oxitun-cli-macos-{amd64,arm64}
+make build-cli-linux   # bin/oxitun-cli-linux-{amd64,arm64}
+make build-cli-win     # bin/oxitun-cli-windows-amd64.exe
+
+# 本机 CLI + GUI 全部
+make build
+
+# 发布前检查（版本一致性 + fmt + clippy + 测试 + vue-tsc）
+make release
+
+# 清理所有构建产物（bin/、target/、node_modules/、dist/）
+make clean
+```
+
+> GUI 各平台安装包（.dmg / .deb / .msi 等）由 Tauri 依赖对应平台 SDK 生成，需在本机或 CI 对应平台 runner 上构建；打 `v*` tag 会触发 `.github/workflows/release.yml` 自动产出 macOS/Linux 各 amd64、arm64 及 Windows amd64，共 5 个 CLI 产物与对应桌面安装包。
 
 ### 💻 方式一：运行桌面版客户端 (GUI)
 ```bash
 # 1. 安装前端依赖
-npm install
+cd apps/desktop && npm install
 
-# 2. 启动开发服务器与 Tauri 客户端 (已默认开启最高优化级别)
+# 2. 启动开发服务器与 Tauri 客户端
 npm run tauri dev
 
 # 3. 编译发布为原生应用包 (.app / .dmg)
@@ -64,13 +91,13 @@ npm run tauri build
 
 ### 🖥️ 方式二：运行服务端命令行版 (CLI - 适合无界面的 Linux/软路由)
 ```bash
-# 1. 进入命令行 crate 目录
-cd crates/cli
+# 1. 构建（或使用 make build-cli）
+cargo build -p oxitun-cli --release
 
 # 2. 直接指定您的配置文件启动代理引擎
-cargo run --release -- --config ../../configs/config.yaml
+./target/release/oxitun-cli --config configs/config.yaml
 
-# 提示：您可以使用 RUST_LOG 环境变量来控制输出日志级别，如 RUST_LOG=debug cargo run ...
+# 提示：您可以使用 RUST_LOG 环境变量来控制输出日志级别，如 RUST_LOG=debug ./target/release/oxitun-cli ...
 ```
 
 ## 📜 许可证

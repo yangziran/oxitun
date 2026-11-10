@@ -7,8 +7,17 @@ dist-ssr/
 # Rust & Cargo
 target/
 
+# 构建产物（Makefile 输出）
+bin/
+
 # Tauri
 apps/desktop/src-tauri/target/
+
+# 敏感备份与临时文件，避免误提交含凭据的副本
+/config.yaml
+*.bak
+*.tmp
+configs/*.local.yaml
 
 # OS / Editor
 .DS_Store

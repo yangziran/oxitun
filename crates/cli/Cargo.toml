@@ -1,6 +1,6 @@
 [package]
 name = "oxitun-cli"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 [dependencies]
@@ -10,3 +10,8 @@ clap = { version = "4.5.1", features = ["derive"] }
 log = "0.4.34"
 env_logger = "0.11.11"
 anyhow = "1.0.104"
+service-manager = "0.11.0"
+
+[target.'cfg(windows)'.dependencies]
+# Windows 服务控制循环：SCM 控制事件桥接（仅 Windows 编译）
+windows-service = "0.8"

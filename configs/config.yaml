@@ -17,31 +17,29 @@ servers:
     # 认证配置
     auth_type: "password"         # 认证方式：'password' 或 'key'
     password: "your_password"     # 登录密码（保存/运行后会被自动加密）
-    key_path: "~/.ssh/id_rsa"     # 私钥路径（若 auth_type 为 key）
+    key_path: ""                  # 私钥路径（auth_type 为 key 时填写，支持 ~/ 前缀）
     encrypted: false              # 密码是否已被加密
     
     # 连接质量与优化
     pool_size: 8                  # 连接池并发数 (利用多路复用提升吞吐，默认 8)
-    keep_alive_interval: 15       # SSH 保活心跳间隔 (秒，默认 3)
-    reconnect_attempts: 3         # 断线重连尝试次数 (默认 999)
+    keep_alive_interval: 15       # SSH 保活心跳间隔 (秒，默认 3，0 表示关闭)
     timeout_seconds: 15           # 连接超时时间 (秒，默认 15)
-    
+
     # 高级安全设置
-    compression: false            # 是否启用 SSH 压缩 (提升文本传输速度，但消耗 CPU，默认 false)
-    check_host_ip: true           # 是否检查 Host IP 变更 (默认 true)
-    strict_host_key: true         # 是否严格验证主机密钥 (默认 true)
-    address_family: "Any"         # IP 地址族：'Any', 'IPv4', 'IPv6'
+    strict_host_key: true         # 是否严格验证主机密钥 (TOFU，默认 true；false 为显式不安全模式)
+    host_key: ""                  # 可选：预置主机密钥 SHA256 指纹（形如 SHA256:xxxx），用于无人值守首次信任
+    # jump_host: "bastion"        # 可选：ProxyJump 跳板节点名（引用 servers 中另一节点，支持链式，自动检测循环）
 
 tunnels:
   - name: "SOCKS5 Proxy"          # 隧道名称
     server_names: ["myserver"]    # 该隧道绑定的服务器名称列表
-    type: "Dynamic"               # 隧道类型：'Dynamic' (SOCKS5 代理) 或 'Local' (本地端口转发)
+    type: "dynamic"               # 隧道类型：'dynamic' (SOCKS5 代理) 或 'local' (本地端口转发)
     port: 1080                    # 本地监听的端口
     remote_addr: null             # 目标地址（仅 Local 模式需要，格式为 host:port，例如 "192.168.1.1:80"）
     share_on_lan: false           # 是否允许局域网其他设备连接本机代理
 
 routing:
-  mode: "Global"                  # 路由模式：'Global' (全局), 'Whitelist' (白名单/绕过大陆), 'Blacklist' (黑名单/仅代理名单内), 'Direct' (直连)
+  mode: "global"                  # 路由模式：'global' (全局), 'whitelist' (白名单/绕过大陆), 'blacklist' (黑名单/仅代理名单内), 'direct' (直连)
   bypass_lan: true                # 是否绕过局域网/私有 IP 地址 (开启后将自动直连 localhost, 127.0.0.1, 192.168.x.x, 10.x.x.x 等内网地址)
   whitelist:                      # 强制走代理的域名白名单
     - "google.com"

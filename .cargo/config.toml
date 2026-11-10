@@ -1,2 +1,5 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# 发布构建（含 CI）不使用 target-cpu=native，避免生成在旧 CPU 上无法运行的指令。
+# 本机性能优化构建可显式启用，例如：
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
+# [build]
+# rustflags = ["-C", "target-cpu=native"]

@@ -1,8 +1,8 @@
-use crate::config::{RoutingConfig, RouteMode};
-use log::{info, error, debug};
+use crate::config::{RouteMode, RoutingConfig};
+use ipnet::IpNet;
+use log::{debug, error, info};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use ipnet::IpNet;
 use tokio::fs;
 
 /// 核心路由分流引擎，负责根据黑白名单及局域网/大陆IP绕行规则判断流量走向
@@ -30,7 +30,7 @@ impl Router {
                 whitelist_domains.push(rule.clone());
             }
         }
-        
+
         let mut blacklist_cidrs = Vec::new();
         let mut blacklist_domains = Vec::new();
         for rule in &config.blacklist {
@@ -60,15 +60,20 @@ impl Router {
     }
 
     async fn load_chnroutes(&mut self, url: &str) {
-        let cache_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("OxiTun");
+        let cache_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("OxiTun");
         let _ = fs::create_dir_all(&cache_dir).await;
         let cache_file = cache_dir.join("chnroutes.txt");
 
         let mut lines = String::new();
-        
+
         // 尝试从远端下载路由列表
-        
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
         match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(text) = resp.text().await {
@@ -98,7 +103,7 @@ impl Router {
                 routes.push(parsed);
             }
         }
-        
+
         routes.sort_by_key(|r| r.0);
         self.chnroutes = routes;
         info!("成功加载 {} 条大陆 IP 直连路由规则", self.chnroutes.len());
@@ -109,38 +114,39 @@ impl Router {
         if let Ok(ip) = is_ip {
             cidrs.iter().any(|cidr| cidr.contains(&ip))
         } else {
-            domains.iter().any(|d| host == d || host.ends_with(&format!(".{}", d)))
+            domains
+                .iter()
+                .any(|d| host == d || host.ends_with(&format!(".{}", d)))
         }
     }
 
     pub async fn should_proxy(&self, host: &str) -> bool {
         match self.config.mode {
             RouteMode::Global => {
-                if self.config.bypass_lan {
-                    if let Ok(ip) = self.resolve_and_check_bypass(host).await {
-                        if ip {
-                            return false;
-                        }
-                    }
+                if self.config.bypass_lan
+                    && let Ok(ip) = self.resolve_and_check_bypass(host).await
+                    && ip
+                {
+                    return false;
                 }
                 true
-            },
+            }
             RouteMode::Direct => false,
             RouteMode::Whitelist => {
                 self.match_rules(host, &self.whitelist_domains, &self.whitelist_cidrs)
             }
             RouteMode::Blacklist => {
-                let in_blacklist = self.match_rules(host, &self.blacklist_domains, &self.blacklist_cidrs);
+                let in_blacklist =
+                    self.match_rules(host, &self.blacklist_domains, &self.blacklist_cidrs);
                 if in_blacklist {
                     return false;
                 }
                 // 若不在黑名单内则默认代理，除非启用了绕过局域网/大陆IP，并且目标为境内 IP
-                if self.config.bypass_lan {
-                    if let Ok(ip) = self.resolve_and_check_bypass(host).await {
-                        if ip {
-                            return false; // 局域网及大陆 IP 执行直连
-                        }
-                    }
+                if self.config.bypass_lan
+                    && let Ok(ip) = self.resolve_and_check_bypass(host).await
+                    && ip
+                {
+                    return false; // 局域网及大陆 IP 执行直连
                 }
                 true
             }
@@ -163,26 +169,28 @@ impl Router {
             debug!("IP {} 属于本地/局域网/多播地址，跳过代理直接连接", ip);
             return Ok(true);
         }
-        
-        if let std::net::IpAddr::V4(ipv4) = ip {
-            if self.is_cn_ip(ipv4) {
-                return Ok(true);
-            }
+
+        if let std::net::IpAddr::V4(ipv4) = ip
+            && self.is_cn_ip(ipv4)
+        {
+            return Ok(true);
         }
         Ok(false)
     }
 
     fn is_cn_ip(&self, ip: Ipv4Addr) -> bool {
         let val = u32::from_be_bytes(ip.octets());
-        self.chnroutes.binary_search_by(|&(start, end)| {
-            if val < start {
-                std::cmp::Ordering::Greater
-            } else if val > end {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }).is_ok()
+        self.chnroutes
+            .binary_search_by(|&(start, end)| {
+                if val < start {
+                    std::cmp::Ordering::Greater
+                } else if val > end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
     }
 }
 
@@ -191,11 +199,11 @@ fn is_local_or_lan(ip: IpAddr) -> bool {
         IpAddr::V4(ipv4) => {
             let octets = ipv4.octets();
             // 127.0.0.0/8 (Loopback)
-            octets[0] == 127 || 
+            octets[0] == 127 ||
             // 10.0.0.0/8 (Private)
-            octets[0] == 10 || 
+            octets[0] == 10 ||
             // 172.16.0.0/12 (Private)
-            (octets[0] == 172 && (16..=31).contains(&octets[1])) || 
+            (octets[0] == 172 && (16..=31).contains(&octets[1])) ||
             // 192.168.0.0/16 (Private)
             (octets[0] == 192 && octets[1] == 168) ||
             // 169.254.0.0/16 (Link-local)
@@ -204,7 +212,7 @@ fn is_local_or_lan(ip: IpAddr) -> bool {
             (octets[0] >= 224 && octets[0] <= 239) ||
             // 255.255.255.255 (Broadcast)
             ipv4.is_broadcast()
-        },
+        }
         IpAddr::V6(ipv6) => {
             let segments = ipv6.segments();
             // ::1 (Loopback)
@@ -221,14 +229,105 @@ fn is_local_or_lan(ip: IpAddr) -> bool {
 
 fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = cidr.split('/').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 {
+        return None;
+    }
     let ip = parts[0].parse::<Ipv4Addr>().ok()?;
     let mask = parts[1].parse::<u32>().ok()?;
     let ip_val = u32::from_be_bytes(ip.octets());
-    let mask_val = if mask == 0 { 0 } else if mask > 32 { return None; } else { !0u32 << (32 - mask) };
-    
+    let mask_val = if mask == 0 {
+        0
+    } else if mask > 32 {
+        return None;
+    } else {
+        !0u32 << (32 - mask)
+    };
+
     let start = ip_val & mask_val;
     let end = start | !mask_val;
-    
+
     Some((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RouteMode;
+
+    async fn make_router(mode: RouteMode, whitelist: Vec<&str>, blacklist: Vec<&str>) -> Router {
+        // bypass_lan=false 避免测试联网下载 chnroutes
+        let config = RoutingConfig {
+            mode,
+            bypass_lan: false,
+            whitelist: whitelist.into_iter().map(String::from).collect(),
+            blacklist: blacklist.into_iter().map(String::from).collect(),
+        };
+        Router::new(config, "").await
+    }
+
+    #[test]
+    fn parse_cidr_range() {
+        let (start, end) = parse_cidr("192.168.1.0/24").unwrap();
+        assert_eq!(start, u32::from_be_bytes([192, 168, 1, 0]));
+        assert_eq!(end, u32::from_be_bytes([192, 168, 1, 255]));
+        assert!(parse_cidr("10.0.0.0/33").is_none());
+        assert!(parse_cidr("not-a-cidr").is_none());
+    }
+
+    #[tokio::test]
+    async fn domain_suffix_matching_has_boundary() {
+        let router = make_router(RouteMode::Whitelist, vec!["google.com"], vec![]).await;
+        assert!(router.should_proxy("google.com").await, "精确匹配");
+        assert!(router.should_proxy("mail.google.com").await, "子域匹配");
+        assert!(
+            !router.should_proxy("evilgoogle.com").await,
+            "后缀拼接不得误匹配"
+        );
+        assert!(!router.should_proxy("google.com.evil.com").await);
+    }
+
+    #[tokio::test]
+    async fn cidr_matching() {
+        let router = make_router(RouteMode::Whitelist, vec!["10.0.0.0/8"], vec![]).await;
+        assert!(router.should_proxy("10.1.2.3").await);
+        assert!(!router.should_proxy("11.0.0.1").await);
+    }
+
+    #[tokio::test]
+    async fn mode_semantics() {
+        let r = make_router(RouteMode::Global, vec![], vec![]).await;
+        assert!(r.should_proxy("anything.com").await, "Global 全部代理");
+
+        let r = make_router(RouteMode::Direct, vec![], vec![]).await;
+        assert!(!r.should_proxy("anything.com").await, "Direct 全部直连");
+
+        let r = make_router(RouteMode::Blacklist, vec![], vec!["ads.com"]).await;
+        assert!(!r.should_proxy("ads.com").await, "黑名单内直连");
+        assert!(r.should_proxy("news.com").await, "黑名单外默认代理");
+
+        let r = make_router(RouteMode::Whitelist, vec!["work.com"], vec![]).await;
+        assert!(r.should_proxy("work.com").await, "白名单内代理");
+        assert!(!r.should_proxy("news.com").await, "白名单外默认直连");
+    }
+
+    #[tokio::test]
+    async fn lan_ip_bypasses_when_enabled() {
+        let config = RoutingConfig {
+            mode: RouteMode::Global,
+            bypass_lan: true,
+            whitelist: vec![],
+            blacklist: vec![],
+        };
+        let router = Router::new(config, "http://127.0.0.1:1/unreachable").await;
+        assert!(!router.should_proxy("192.168.1.1").await, "局域网 IP 直连");
+        assert!(!router.should_proxy("127.0.0.1").await);
+        assert!(
+            router.should_proxy("8.8.8.8").await,
+            "公网 IP 仍代理（chnroutes 下载失败为空表）"
+        );
+        assert!(
+            router.should_proxy("example.com").await,
+            "域名不本地解析，默认代理"
+        );
+    }
 }

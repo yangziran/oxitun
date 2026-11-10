@@ -1,23 +1,27 @@
-use tauri::menu::{Menu, SubmenuBuilder, PredefinedMenuItem};
+use tauri::menu::{Menu, PredefinedMenuItem, SubmenuBuilder};
 use tauri::AppHandle;
 
 #[cfg(target_os = "macos")]
 pub fn create_app_menu(app_handle: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let app_menu = Menu::new(app_handle)?;
-    
+
     // OxiTun 菜单
     let prefs = tauri::menu::MenuItemBuilder::with_id("preferences", "偏好设置...")
         .accelerator("CmdOrCtrl+,")
         .build(app_handle)?;
-        
+
     let oxitun_menu = SubmenuBuilder::new(app_handle, "OxiTun")
-        .item(&PredefinedMenuItem::about(app_handle, Some("关于 OxiTun"), None)?)
+        .item(&PredefinedMenuItem::about(
+            app_handle,
+            Some("关于 OxiTun"),
+            None,
+        )?)
         .separator()
         .item(&prefs)
         .separator()
         .item(&PredefinedMenuItem::quit(app_handle, Some("退出 OxiTun"))?)
         .build()?;
-        
+
     // 编辑菜单
     let edit_menu = SubmenuBuilder::new(app_handle, "编辑")
         .item(&PredefinedMenuItem::undo(app_handle, Some("撤销"))?)
@@ -31,7 +35,7 @@ pub fn create_app_menu(app_handle: &AppHandle) -> tauri::Result<Menu<tauri::Wry>
 
     let _ = app_menu.append(&oxitun_menu);
     let _ = app_menu.append(&edit_menu);
-    
+
     Ok(app_menu)
 }
 

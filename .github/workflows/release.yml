@@ -5,7 +5,34 @@ on:
       - 'v*' # 当推送形如 v1.0.0 的 tag 时自动触发构建
 
 jobs:
+  pre-check:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Version consistency
+        run: ./scripts/check-version.sh
+
+      - name: Check tag version
+        shell: bash
+        run: |
+          workspace_version=$(sed -n '/^\[workspace.package\]/,/^$/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ -z "$workspace_version" || "$tag_version" != "$workspace_version" ]]; then
+            echo "ERROR: tag 版本 '$tag_version' 与 workspace 版本 '$workspace_version' 不一致" >&2
+            exit 1
+          fi
+          echo "tag 与 workspace 版本一致: $workspace_version"
+
+      - name: Test
+        run: cargo test --workspace
+
   build-and-release:
+    needs: pre-check
     permissions:
       contents: write
     strategy:
@@ -14,15 +41,25 @@ jobs:
         include:
           - os: macos-latest
             target: x86_64-apple-darwin
+            cli_target: x86_64-apple-darwin
             cli_asset: oxitun-cli-macos-amd64
           - os: macos-latest
             target: aarch64-apple-darwin
+            cli_target: aarch64-apple-darwin
             cli_asset: oxitun-cli-macos-arm64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            cli_target: x86_64-unknown-linux-musl
             cli_asset: oxitun-cli-linux-amd64
+          # Linux arm64 使用 ARM 原生 runner：GUI 随宿主编译（glibc），
+          # CLI 用 musl 静态链接，与 Makefile build-cli-linux 口径一致
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cli_target: aarch64-unknown-linux-musl
+            cli_asset: oxitun-cli-linux-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            cli_target: x86_64-pc-windows-msvc
             cli_asset: oxitun-cli-windows-amd64.exe
 
     runs-on: ${{ matrix.os }}
@@ -38,31 +75,33 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }},${{ matrix.cli_target }}
 
       - name: Install dependencies (Ubuntu only)
-        if: matrix.os == 'ubuntu-22.04'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # GUI（WebKitGTK/AppIndicator）+ CLI musl 静态链接（musl-tools 提供 musl-gcc，
+          # aws-lc-sys 等 C 依赖在 musl target 下编译需要）
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf musl-tools
 
       - name: Install frontend dependencies
         working-directory: apps/desktop
-        run: npm install
+        run: npm ci
 
       # ==============================
-      # 1. 编译独立的服务端 CLI
+      # 1. 编译独立的服务端 CLI（Linux 走 musl 静态链接，与 Makefile 口径一致）
       # ==============================
       - name: Build CLI
-        run: cargo build -p oxitun-cli --release --target ${{ matrix.target }}
+        run: cargo build -p oxitun-cli --release --target ${{ matrix.cli_target }}
 
       - name: Rename CLI binary
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/${{ matrix.target }}/release/oxitun-cli.exe ${{ matrix.cli_asset }}
+            cp target/${{ matrix.cli_target }}/release/oxitun-cli.exe ${{ matrix.cli_asset }}
           else
-            cp target/${{ matrix.target }}/release/oxitun-cli ${{ matrix.cli_asset }}
+            cp target/${{ matrix.cli_target }}/release/oxitun-cli ${{ matrix.cli_asset }}
           fi
 
       # ==============================

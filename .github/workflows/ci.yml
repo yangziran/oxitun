@@ -1,0 +1,49 @@
+name: CI
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Version consistency
+        run: ./scripts/check-version.sh
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  # 仅检查 CLI 与核心库在 Windows 目标的可编译性（含 windows_service.rs 的 SCM 控制循环）。
+  # 刻意排除 apps/desktop/src-tauri（Tauri 需 WebView2 等重型原生依赖），保持该 job 轻量。
+  # 关键价值：捕获 #[cfg(windows)] 分支与 windows-service crate 的编译错误，避免真机踩坑。
+  windows-cli:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check CLI + core on Windows
+        run: cargo check -p oxitun-cli -p oxitun-core --all-targets
+
+  frontend:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Type check
+        working-directory: apps/desktop
+        run: npx vue-tsc --noEmit

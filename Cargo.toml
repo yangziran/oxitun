@@ -6,6 +6,10 @@ members = [
 ]
 resolver = "2"
 
+# Rust 侧版本号单一来源；tauri.conf.json / package.json 由 CI 一致性检查兜底
+[workspace.package]
+version = "0.1.0"
+
 [profile.dev]
 # Fast local compilation
 debug = true

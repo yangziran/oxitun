@@ -9,6 +9,8 @@ struct CopyBuffer {
     read_done: bool,
     /// 标志缓冲区内是否有残留数据需要向写入端 flush
     need_flush: bool,
+    /// 标志写入端是否已完成半关闭（shutdown 只执行一次）
+    shutdown_done: bool,
     /// 当前已读出（消费）的缓冲区偏移量
     pos: usize,
     /// 缓冲区内有效数据的总长度
@@ -25,6 +27,7 @@ impl CopyBuffer {
         Self {
             read_done: false,
             need_flush: false,
+            shutdown_done: false,
             pos: 0,
             cap: 0,
             amt: 0,
@@ -48,6 +51,12 @@ impl CopyBuffer {
                     if self.need_flush {
                         std::task::ready!(writer.as_mut().poll_flush(cx))?;
                         self.need_flush = false;
+                    }
+                    // 读到 EOF 且缓冲已 flush 后，半关闭写端，
+                    // 让对端感知写方向关闭（避免 HTTP/1.0、SMTP 等协议永久死等）
+                    if !self.shutdown_done {
+                        std::task::ready!(writer.as_mut().poll_shutdown(cx))?;
+                        self.shutdown_done = true;
                     }
                     return Poll::Ready(Ok(self.amt));
                 }
@@ -75,7 +84,10 @@ impl CopyBuffer {
             }
 
             while self.pos < self.cap {
-                match writer.as_mut().poll_write(cx, &self.buf[self.pos..self.cap]) {
+                match writer
+                    .as_mut()
+                    .poll_write(cx, &self.buf[self.pos..self.cap])
+                {
                     Poll::Ready(Ok(0)) => {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::WriteZero,
@@ -117,7 +129,12 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut a_to_b_done = self.a_to_b.read_done && self.a_to_b.pos == self.a_to_b.cap;
         let mut b_to_a_done = self.b_to_a.read_done && self.b_to_a.pos == self.b_to_a.cap;
-        let BidirectionalCopy { a, b, a_to_b, b_to_a } = &mut *self;
+        let BidirectionalCopy {
+            a,
+            b,
+            a_to_b,
+            b_to_a,
+        } = &mut *self;
 
         // 处理 A 端向 B 端的单向拷贝
         if !a_to_b_done {
@@ -160,4 +177,42 @@ where
         b_to_a: CopyBuffer::new(),
     }
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    /// 半关闭语义：一端写完数据并 shutdown 写端后，
+    /// 桥接对端的读取方应收到数据 + EOF（旧实现只 flush 不 shutdown，会永久死等）。
+    #[tokio::test]
+    async fn half_close_propagates_write_shutdown() {
+        let (mut a_client, mut a_server) = duplex(1024);
+        let (mut b_client, mut b_server) = duplex(1024);
+
+        let handle =
+            tokio::spawn(async move { copy_bidirectional_64k(&mut a_server, &mut b_server).await });
+
+        // A 侧发送请求后半关闭写端
+        a_client.write_all(b"req").await.unwrap();
+        a_client.shutdown().await.unwrap();
+
+        // B 侧应读到数据后收到 EOF（证明桥接对 b_server 执行了 shutdown）
+        let mut buf = Vec::new();
+        b_client.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"req");
+
+        // B 侧回应并半关闭，A 侧应读到回应 + EOF
+        b_client.write_all(b"resp").await.unwrap();
+        b_client.shutdown().await.unwrap();
+
+        let mut buf2 = Vec::new();
+        a_client.read_to_end(&mut buf2).await.unwrap();
+        assert_eq!(buf2, b"resp");
+
+        let (a_to_b, b_to_a) = handle.await.unwrap().unwrap();
+        assert_eq!(a_to_b, 3);
+        assert_eq!(b_to_a, 4);
+    }
 }
