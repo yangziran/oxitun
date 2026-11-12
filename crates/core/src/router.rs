@@ -27,7 +27,13 @@ impl Router {
             } else if let Ok(ip) = rule.parse::<IpAddr>() {
                 whitelist_cidrs.push(IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).unwrap());
             } else {
-                whitelist_domains.push(rule.clone());
+                // 容错：非法 CIDR 不应静默降级为域名规则，记警告并跳过
+                // （正常入口已由 Config::validate 拦截，此处仅兜底）
+                if rule.contains('/') {
+                    log::warn!("白名单规则 '{}' 不是合法 CIDR，已忽略", rule);
+                    continue;
+                }
+                whitelist_domains.push(normalize_domain(rule));
             }
         }
 
@@ -39,7 +45,13 @@ impl Router {
             } else if let Ok(ip) = rule.parse::<IpAddr>() {
                 blacklist_cidrs.push(IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).unwrap());
             } else {
-                blacklist_domains.push(rule.clone());
+                // 容错：非法 CIDR 不应静默降级为域名规则，记警告并跳过
+                // （正常入口已由 Config::validate 拦截，此处仅兜底）
+                if rule.contains('/') {
+                    log::warn!("黑名单规则 '{}' 不是合法 CIDR，已忽略", rule);
+                    continue;
+                }
+                blacklist_domains.push(normalize_domain(rule));
             }
         }
 
@@ -66,46 +78,54 @@ impl Router {
         let _ = fs::create_dir_all(&cache_dir).await;
         let cache_file = cache_dir.join("chnroutes.txt");
 
-        let mut lines = String::new();
-
-        // 尝试从远端下载路由列表
-
+        // 尝试从远端下载路由列表；
+        // 下载失败、body 读取失败、或解析不出任何有效 CIDR 一律视为失败，
+        // 回退旧缓存（避免用损坏/空白内容覆盖可用缓存）
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
-        match client.get(url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(text) = resp.text().await {
-                    lines = text;
-                    let _ = fs::write(&cache_file, &lines).await;
-                    info!("已成功下载并缓存最新的 chnroutes.txt 路由表");
+        let downloaded = match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(text) => {
+                    let routes = parse_route_lines(&text);
+                    if routes.is_empty() {
+                        error!("下载的 chnroutes.txt 不含有效 CIDR 规则，回退本地缓存");
+                        None
+                    } else {
+                        // 确认内容有效后才写缓存
+                        let _ = fs::write(&cache_file, &text).await;
+                        info!("已成功下载并缓存最新的 chnroutes.txt 路由表");
+                        Some(routes)
+                    }
+                }
+                Err(e) => {
+                    error!("读取 chnroutes.txt 响应体失败: {}，回退本地缓存", e);
+                    None
+                }
+            },
+            _ => None,
+        };
+
+        let routes = match downloaded {
+            Some(routes) => routes,
+            None => {
+                // 回退使用本地旧缓存
+                match fs::read_to_string(&cache_file).await {
+                    Ok(text) => {
+                        info!("从本地缓存成功加载 chnroutes.txt 路由表");
+                        parse_route_lines(&text)
+                    }
+                    Err(_) => {
+                        error!("获取 chnroutes.txt 失败，且未找到本地缓存");
+                        Vec::new()
+                    }
                 }
             }
-            _ => {
-                // 若下载失败，回退使用本地缓存
-                if let Ok(text) = fs::read_to_string(&cache_file).await {
-                    lines = text;
-                    info!("从本地缓存成功加载 chnroutes.txt 路由表");
-                } else {
-                    error!("下载 chnroutes.txt 失败，且未找到本地缓存");
-                }
-            }
-        }
+        };
 
-        let mut routes = Vec::new();
-        for line in lines.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(parsed) = parse_cidr(line) {
-                routes.push(parsed);
-            }
-        }
-
-        routes.sort_by_key(|r| r.0);
-        self.chnroutes = routes;
+        // 合并重叠/相邻区间后再交给二分查找，避免嵌套或交叉区间破坏二分前提
+        self.chnroutes = merge_ranges(routes);
         info!("成功加载 {} 条大陆 IP 直连路由规则", self.chnroutes.len());
     }
 
@@ -114,9 +134,11 @@ impl Router {
         if let Ok(ip) = is_ip {
             cidrs.iter().any(|cidr| cidr.contains(&ip))
         } else {
+            // 与规则加载侧统一规范化：小写并去掉根域结尾点号
+            let host = normalize_domain(host);
             domains
                 .iter()
-                .any(|d| host == d || host.ends_with(&format!(".{}", d)))
+                .any(|d| host == *d || host.ends_with(&format!(".{}", d)))
         }
     }
 
@@ -227,6 +249,21 @@ fn is_local_or_lan(ip: IpAddr) -> bool {
     }
 }
 
+/// 域名规则/匹配目标的统一规范化：转小写并去掉根域结尾点号
+fn normalize_domain(domain: &str) -> String {
+    domain.to_lowercase().trim_end_matches('.').to_string()
+}
+
+/// 从文本中解析出全部有效 CIDR 路由条目（忽略空行与 # 注释行）
+fn parse_route_lines(lines: &str) -> Vec<(u32, u32)> {
+    lines
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(parse_cidr)
+        .collect()
+}
+
 fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
@@ -247,6 +284,28 @@ fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
     let end = start | !mask_val;
 
     Some((start, end))
+}
+
+/// 合并重叠或相邻的 IP 区间（IPv4 以 u32 表示，IPv6 同理可用 u128），
+/// 返回按起点排序且互不重叠的区间列表。
+/// chnroutes 的二分查找要求区间集合满足该不变量：嵌套（如 10.0.0.0/8 包含
+/// 10.1.0.0/16）或交叉的区间会破坏二分的有序前提，导致漏判应直连的 IP。
+/// 合并后既消除重叠又保持二分正确。
+fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    ranges.sort_by_key(|r| r.0);
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            // 包含（start <= last.1）或首尾相邻（start == last.1 + 1）都合并；
+            // saturating_add 防止 last.1 == u32::MAX 时溢出
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -284,6 +343,93 @@ mod tests {
             "后缀拼接不得误匹配"
         );
         assert!(!router.should_proxy("google.com.evil.com").await);
+    }
+
+    /// 域名规则加载与匹配统一规范化：大小写不敏感，结尾点号不影响匹配
+    #[tokio::test]
+    async fn domain_rules_are_normalized() {
+        // 规则侧：大写 + 结尾点号
+        let router = make_router(RouteMode::Whitelist, vec!["Google.COM."], vec![]).await;
+        assert!(router.should_proxy("google.com").await);
+        assert!(router.should_proxy("mail.GOOGLE.COM").await);
+        // 目标侧：结尾点号（DNS 根域写法）
+        assert!(router.should_proxy("google.com.").await);
+        assert!(router.should_proxy("Mail.Google.Com.").await);
+    }
+
+    /// parse_route_lines 跳过注释与空行，且对无有效 CIDR 的内容返回空
+    #[test]
+    fn parse_route_lines_skips_invalid() {
+        let text = "# comment\n\n10.0.0.0/8\nnot-a-cidr\n192.168.0.0/16\n";
+        let routes = parse_route_lines(text);
+        assert_eq!(routes.len(), 2);
+        assert!(parse_route_lines("# only comments\n\n垃圾内容\n").is_empty());
+    }
+
+    /// 嵌套 CIDR（10.0.0.0/8 包含 10.1.0.0/16）合并后，内部 IP 仍能正确判定直连；
+    /// 重叠/相邻区间应合并为更大区间，且结果有序互不重叠（二分前提）
+    #[test]
+    fn merge_ranges_collapses_nested_and_overlapping() {
+        let text = "10.1.0.0/16\n10.0.0.0/8\n192.168.1.0/24\n192.168.0.0/16\n172.16.0.0/24\n172.16.1.0/24\n";
+        let merged = merge_ranges(parse_route_lines(text));
+
+        // 10.0.0.0/8 与 10.1.0.0/16 嵌套 → 一条；192.168.0.0/16 与 192.168.1.0/24 重叠 → 一条；
+        // 172.16.0.0/24 与 172.16.1.0/24 首尾相邻 → 合并为 172.16.0.0 - 172.16.1.255
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged[0],
+            (
+                u32::from_be_bytes([10, 0, 0, 0]),
+                u32::from_be_bytes([10, 255, 255, 255])
+            )
+        );
+        assert_eq!(
+            merged[1],
+            (
+                u32::from_be_bytes([172, 16, 0, 0]),
+                u32::from_be_bytes([172, 16, 1, 255])
+            )
+        );
+        assert_eq!(
+            merged[2],
+            (
+                u32::from_be_bytes([192, 168, 0, 0]),
+                u32::from_be_bytes([192, 168, 255, 255])
+            )
+        );
+
+        // 合并后的区间集合交给二分查找：嵌套区间内部的 IP 不得漏判
+        let router = Router {
+            config: RoutingConfig::default(),
+            chnroutes: merged,
+            whitelist_cidrs: Vec::new(),
+            whitelist_domains: Vec::new(),
+            blacklist_cidrs: Vec::new(),
+            blacklist_domains: Vec::new(),
+        };
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert!(router.is_cn_ip(ip("10.1.2.3")), "嵌套区间内部 IP 必须命中");
+        assert!(
+            router.is_cn_ip(ip("10.200.1.1")),
+            "外层区间其他 IP 必须命中"
+        );
+        assert!(router.is_cn_ip(ip("192.168.1.1")));
+        assert!(router.is_cn_ip(ip("192.168.200.1")));
+        assert!(
+            router.is_cn_ip(ip("172.16.1.1")),
+            "相邻合并区间的右半部分必须命中"
+        );
+        assert!(!router.is_cn_ip(ip("11.0.0.1")));
+        assert!(!router.is_cn_ip(ip("172.16.2.1")));
+    }
+
+    /// 不重叠且不相邻的区间必须保持独立，不得被误合并
+    #[test]
+    fn merge_ranges_keeps_disjoint_intervals() {
+        let merged = merge_ranges(parse_route_lines("10.0.0.0/24\n10.0.2.0/24\n"));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].1, u32::from_be_bytes([10, 0, 0, 255]));
+        assert_eq!(merged[1].0, u32::from_be_bytes([10, 0, 2, 0]));
     }
 
     #[tokio::test]

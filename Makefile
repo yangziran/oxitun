@@ -9,7 +9,7 @@ GUI_DIR = apps/desktop
 # 从 workspace 根 Cargo.toml 提取版本（供说明性输出使用）
 VERSION := $(shell grep -A2 '^\[workspace.package\]' Cargo.toml | grep '^version' | sed 's/.*"\(.*\)"/\1/')
 
-.PHONY: all clean check-version \
+.PHONY: all clean clean-all check-version \
         build-cli build-cli-mac build-cli-linux build-cli-win \
         build-gui build-gui-mac build-gui-linux build-gui-win \
         build release bench
@@ -99,14 +99,24 @@ bench:
 # 发布前检查（版本一致性 + 测试 + lint）
 release: check-version
 	@cargo fmt --all -- --check
-	@cargo clippy --workspace --all-targets -- -D warnings
-	@cargo test --workspace
+	@cargo clippy --workspace --all-targets --locked -- -D warnings
+	@cargo test --workspace --locked
 	@cd $(GUI_DIR) && npx vue-tsc --noEmit
 	@echo "✅ 发布检查通过，可打 tag 触发 CI 打包"
 
+# 清理（保留 Cargo registry 缓存，下次构建无需重新下载依赖）
 clean:
-	@echo "Cleaning up..."
+	@echo "Cleaning local build artifacts (keeping dependency cache)..."
+	@rm -rf $(BUILD_DIR)
+	@cargo clean --doc 2>/dev/null || true
+	@rm -rf target/debug/incremental target/debug/.fingerprint target/debug/build target/debug/deps
+	@rm -rf $(GUI_DIR)/node_modules $(GUI_DIR)/dist
+	@echo "完成（保留 ~/.cargo/registry/ 中的依赖缓存）"
+
+# 全清：包括所有依赖编译产物，下次构建需重新编译全部依赖（registry 下载缓存保留；慎用于 CI 或磁盘紧张时）
+clean-all:
+	@echo "Deep cleaning ALL build artifacts including compiled dependencies (keeping registry downloads)..."
 	@rm -rf $(BUILD_DIR)
 	@cargo clean
 	@rm -rf $(GUI_DIR)/node_modules $(GUI_DIR)/dist
-	@echo "完成"
+	@echo "完成（已清空 target/，下次构建将重新编译所有依赖）"

@@ -18,9 +18,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   # 仅检查 CLI 与核心库在 Windows 目标的可编译性（含 windows_service.rs 的 SCM 控制循环）。
   # 刻意排除 apps/desktop/src-tauri（Tauri 需 WebView2 等重型原生依赖），保持该 job 轻量。
@@ -32,7 +32,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
       - name: Check CLI + core on Windows
-        run: cargo check -p oxitun-cli -p oxitun-core --all-targets
+        run: cargo check -p oxitun-cli -p oxitun-core --all-targets --locked
 
   frontend:
     runs-on: macos-latest

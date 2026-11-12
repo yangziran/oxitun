@@ -22,22 +22,26 @@ echo "== 代理: $SOCKS  目标: $URL =="
 
 echo "-- 首包延迟 (TTFB, 5 次) --"
 for i in 1 2 3 4 5; do
-  curl -x "socks5://$SOCKS" -o /dev/null -s \
+  curl -x "socks5h://$SOCKS" -o /dev/null -s \
     -w "  第${i}次: TTFB=%{time_starttransfer}s 总耗时=%{time_total}s\n" "$URL" --max-time 30 -r 0-0
 done
 
 echo "-- 吞吐 (下载约 100MB) --"
-curl -x "socks5://$SOCKS" -o /dev/null -s \
+curl -x "socks5h://$SOCKS" -o /dev/null -s \
   -w "  总耗时=%{time_total}s  平均速度=%{speed_download} B/s\n" "$URL" --max-time 300
 
 echo "-- 并发连接 (50 并发小请求) --"
 fail=0
 for i in $(seq 1 50); do
-  curl -x "socks5://$SOCKS" -o /dev/null -s --max-time 20 -r 0-1023 "$URL" &
+  curl -x "socks5h://$SOCKS" -o /dev/null -s --max-time 20 -r 0-1023 "$URL" &
 done > /dev/null
 for job in $(jobs -p); do
   wait "$job" || fail=$((fail + 1))
 done
 echo "  失败数: $fail / 50"
+if [ "$fail" -gt 0 ]; then
+  echo "ERROR: 并发测试存在失败连接（$fail/50），判定本次基准不合格" >&2
+  exit 1
+fi
 
 echo "== 完成。记录本机内存占用（ps -o rss= -p \$(pgrep -f oxitun)）作为内存指标 =="

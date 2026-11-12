@@ -4,18 +4,33 @@ on:
     tags:
       - 'v*' # 当推送形如 v1.0.0 的 tag 时自动触发构建
 
+# 同一 tag 的重复推送串行执行，不取消进行中的发布（避免 Release 半成品）
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   pre-check:
     runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Version consistency
         run: ./scripts/check-version.sh
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Check tag version
         shell: bash
@@ -29,10 +44,13 @@ jobs:
           echo "tag 与 workspace 版本一致: $workspace_version"
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   build-and-release:
     needs: pre-check
+    # contents: write 是 tauri-action 创建 Release 与 softprops 上传产物所必需的权限。
+    # 构建步骤本身不需要写权限，但由于构建与上传同在一个 job 中难以拆分权限粒度，
+    # 故在 job 级保留 contents: write，特此说明。
     permissions:
       contents: write
     strategy:
@@ -66,6 +84,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -93,7 +113,7 @@ jobs:
       # 1. 编译独立的服务端 CLI（Linux 走 musl 静态链接，与 Makefile 口径一致）
       # ==============================
       - name: Build CLI
-        run: cargo build -p oxitun-cli --release --target ${{ matrix.cli_target }}
+        run: cargo build -p oxitun-cli --release --locked --target ${{ matrix.cli_target }}
 
       - name: Rename CLI binary
         shell: bash
@@ -104,6 +124,17 @@ jobs:
             cp target/${{ matrix.cli_target }}/release/oxitun-cli ${{ matrix.cli_asset }}
           fi
 
+      # 为 CLI 产物生成 SHA-256 校验文件，随产物一并上传。
+      # macOS 无 sha256sum（coreutils 命令），需用自带的 shasum -a 256。
+      - name: Generate SHA-256 checksum
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            shasum -a 256 "${{ matrix.cli_asset }}" > "${{ matrix.cli_asset }}.sha256"
+          else
+            sha256sum "${{ matrix.cli_asset }}" > "${{ matrix.cli_asset }}.sha256"
+          fi
+
       # ==============================
       # 2. 编译并打包 Tauri 桌面端
       # ==============================
@@ -112,7 +143,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} -- --locked
           tagName: ${{ github.ref_name }} # Tauri Action 会自动将安装包传到此 Tag 的 Release 中
           releaseName: 'OxiTun ${{ github.ref_name }}'
           releaseBody: 'OxiTun 发布版本'
@@ -120,11 +151,34 @@ jobs:
           prerelease: false
           projectPath: apps/desktop
 
+      # 为 GUI 安装包生成 SHA-256 校验文件；兼容有无 target 三元组目录的 bundle 路径。
+      - name: Generate SHA-256 checksums for GUI bundles
+        shell: bash
+        run: |
+          mkdir -p gui-checksums
+          found=false
+          while IFS= read -r -d '' artifact; do
+            checksum="gui-checksums/$(basename "$artifact").sha256"
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              (cd "$(dirname "$artifact")" && shasum -a 256 "$(basename "$artifact")") > "$checksum"
+            else
+              (cd "$(dirname "$artifact")" && sha256sum "$(basename "$artifact")") > "$checksum"
+            fi
+            found=true
+          done < <(find target -type f -path '*/release/bundle/*' \( -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' -o -name '*.msi' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.app.tar.gz' \) -print0)
+          if [ "$found" != true ]; then
+            echo "ERROR: 未找到 GUI 安装包，无法生成 SHA-256 校验文件" >&2
+            exit 1
+          fi
+
       # ==============================
-      # 3. 将 CLI 附加到同一个 Release 中
+      # 3. 将 CLI 与 GUI 校验文件附加到同一个 Release 中
       # ==============================
-      - name: Upload CLI to Release
+      - name: Upload CLI and GUI checksums to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.cli_asset }}
-          # softprops 会自动匹配当前的 Tag，并将 CLI 塞进 Tauri 刚建好的同一个 Release 里
+          files: |
+            ${{ matrix.cli_asset }}
+            ${{ matrix.cli_asset }}.sha256
+            gui-checksums/*.sha256
+          # softprops 会自动匹配当前的 Tag，并将这些产物塞进 Tauri 刚建好的同一个 Release 里

@@ -1938,6 +1938,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3846,6 +3856,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "dirs 6.0.0",
+ "fs2",
  "hickory-proto",
  "hickory-resolver",
  "hickory-server",
@@ -3857,6 +3868,7 @@ dependencies = [
  "russh",
  "russh-keys",
  "rustls",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3864,6 +3876,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "webpki-roots",
  "winreg 0.56.0",
 ]
@@ -6535,6 +6548,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

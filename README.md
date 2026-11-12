@@ -18,8 +18,8 @@ OxiTun 是一款基于 Rust 和 Tauri 构建的高性能 SSH 隧道与多协议�
 
 ## 🔒 安全与隐私 (Security)
 
-- **动态主密钥 (Dynamic Master Key)**：所有节点密码均使用本地动态生成的强随机密钥进行 AES-256-GCM 加密存储，彻底告别明文密码泄露风险。
-  - 密钥被安全地存放在系统数据目录中（macOS 下为 `~/Library/Application Support/OxiTun/master.key`），文件权限收紧为仅当前用户可读写。
+- **动态主密钥 (Dynamic Master Key)**：节点密码使用本地动态生成的强随机密钥进行 AES-256-GCM 加密存储——桌面端保存后配置文件中的密码为密文；CLI 场景请自行保护配置文件权限。
+  - 密钥被安全地存放在系统数据目录中（macOS 下为 `~/Library/Application Support/OxiTun/master.key`），Unix/macOS 下文件权限收紧为仅当前用户可读写（0600），其他平台依赖系统默认 ACL。
 - **开源脱敏设计**：代码库中保留的 `configs/config.yaml` 仅作为脱敏后的样例模板供开发者参考，保护用户隐私。
 
 ## ⚡ 硬件加速与优化
@@ -71,8 +71,11 @@ make build
 # 发布前检查（版本一致性 + fmt + clippy + 测试 + vue-tsc）
 make release
 
-# 清理所有构建产物（bin/、target/、node_modules/、dist/）
+# 清理（保留依赖缓存，下次构建快）
 make clean
+
+# 全清（包括依赖编译产物，下次需重新编译全部依赖，registry 下载缓存保留；CI 或磁盘紧张时用）
+make clean-all
 ```
 
 > GUI 各平台安装包（.dmg / .deb / .msi 等）由 Tauri 依赖对应平台 SDK 生成，需在本机或 CI 对应平台 runner 上构建；打 `v*` tag 会触发 `.github/workflows/release.yml` 自动产出 macOS/Linux 各 amd64、arm64 及 Windows amd64，共 5 个 CLI 产物与对应桌面安装包。
@@ -94,11 +97,23 @@ npm run tauri build
 # 1. 构建（或使用 make build-cli）
 cargo build -p oxitun-cli --release
 
-# 2. 直接指定您的配置文件启动代理引擎
-./target/release/oxitun-cli --config configs/config.yaml
+# 2. 复制样例配置为根目录 config.yaml（或 configs/config.local.yaml），两者均已被
+#    .gitignore 忽略，避免直接修改受跟踪的样例而误提交凭据，然后编辑填入您的服务器信息
+cp configs/config.yaml config.yaml
+
+# 3. 指定您的配置文件启动代理引擎
+./target/release/oxitun-cli --config config.yaml
 
 # 提示：您可以使用 RUST_LOG 环境变量来控制输出日志级别，如 RUST_LOG=debug ./target/release/oxitun-cli ...
 ```
+
+#### CLI 运维速览
+
+- **热加载**：运行中向进程发送 `SIGHUP`（如 `kill -HUP <pid>`）即可进行带校验与回滚的热加载（仅 Unix 支持）；`general` 段字段（如 `metrics_addr`、`chnroute_url` 等）不参与热加载，修改后需重启进程才生效。隧道启动失败时服务器/路由或部分隧道可能已按新配置生效，基线以实际运行状态为准。
+- **系统服务**：`oxitun-cli service install --config <配置文件路径>` 将 CLI 注册为系统服务（launchd / systemd / Windows Service，开机自启），随后用 `oxitun-cli service start|stop|restart|status|uninstall` 管理。
+- **主机密钥（TOFU）**：默认严格验证主机密钥，首次连接需交互确认；无人值守部署请在配置中预置 `host_key`（形如 `SHA256:xxxx` 的指纹）完成首次信任。`--accept-new-host-key` 可自动信任新主机，仅适合首次信任场景，指纹发生变化时仍会被拒绝。
+- **监控指标**：在配置中设置 `general.metrics_addr`（如 `127.0.0.1:9090`）后启动 Prometheus 指标监听，访问 `http://<metrics_addr>/metrics` 获取运行指标。
+- **局域网共享风险**：`tunnels[].share_on_lan` 开启后代理将绑定全部网络接口（`0.0.0.0` / `[::]`），且 SOCKS5 无任何认证，在公网环境会形成开放代理，任何人都可以滥用你的节点。仅在可信局域网内按需开启，公网机器严禁开启。
 
 ## 📜 许可证
 

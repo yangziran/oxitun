@@ -61,14 +61,33 @@ fn default_chnroute_url() -> String {
     "https://cdn.jsdelivr.net/gh/misakaio/chnroutes2@master/chnroutes.txt".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// 路由引擎的配置，包括代理模式（全局、直连、黑白名单）以及自定义的 IP/域名 分流规则
 pub struct RoutingConfig {
+    /// 缺省为全局代理（与 Rust Default 一致）
+    #[serde(default)]
     pub mode: RouteMode,
+    /// 缺省绕过局域网（serde 与 Rust Default 均为 true）
     #[serde(default = "default_true")]
     pub bypass_lan: bool,
+    #[serde(default)]
     pub whitelist: Vec<String>,
+    #[serde(default)]
     pub blacklist: Vec<String>,
+}
+
+// 手工 Default：保证与 serde 逐字段缺省语义完全一致。
+// 此前 derive 的 Default 在整体缺省 routing 段时给出 bypass_lan=false，
+// 而字段级 serde 缺省为 true，两者行为不一致
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            mode: RouteMode::default(),
+            bypass_lan: default_true(),
+            whitelist: Vec::new(),
+            blacklist: Vec::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -153,6 +172,9 @@ pub struct TunnelConfig {
     pub remote_addr: Option<String>,
     #[serde(default)]
     pub share_on_lan: bool,
+    /// 是否为主代理（显式标记，替代 tunnels[0] 位置约定；至多一个且必须为 Dynamic）
+    #[serde(default)]
+    pub primary: bool,
     /// 多节点策略（仅多 server_names 时有意义）
     #[serde(default)]
     pub strategy: TunnelStrategy,
@@ -174,10 +196,42 @@ impl Config {
     /// 事务式热加载的整批校验：任一错误则整批拒绝，调用方继续运行旧配置
     ///
     /// 校验项：
+    /// - 服务器名、隧道名必须唯一
     /// - 隧道引用的服务器必须存在
     /// - ProxyJump 引用的节点必须存在且不得成环
-    /// - 相同端口且相同 share_on_lan 的隧道视为监听冲突
+    /// - 相同传输协议（TCP/UDP）且相同端口的隧道视为监听冲突
     pub fn validate(&self) -> Result<()> {
+        // 名称唯一性校验
+        let mut seen_servers: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for srv in &self.servers {
+            if !seen_servers.insert(srv.name.as_str()) {
+                return Err(anyhow::anyhow!("服务器名 {} 重复", srv.name));
+            }
+        }
+        let mut seen_tunnels: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for tun in &self.tunnels {
+            if !seen_tunnels.insert(tun.name.as_str()) {
+                return Err(anyhow::anyhow!("隧道名 {} 重复", tun.name));
+            }
+        }
+
+        // 路由规则校验：含 '/' 的规则必须是合法 CIDR。
+        // 否则如 "10.0.0.0/33" 会静默降级为域名规则，不报错也不生效
+        for (list_name, rules) in [
+            ("白名单", &self.routing.whitelist),
+            ("黑名单", &self.routing.blacklist),
+        ] {
+            for rule in rules {
+                if rule.contains('/') && rule.parse::<ipnet::IpNet>().is_err() {
+                    return Err(anyhow::anyhow!(
+                        "路由{}规则 '{}' 不是合法 CIDR",
+                        list_name,
+                        rule
+                    ));
+                }
+            }
+        }
+
         let server_names: std::collections::HashSet<&str> =
             self.servers.iter().map(|s| s.name.as_str()).collect();
 
@@ -195,6 +249,27 @@ impl Config {
             if tun.tunnel_type != TunnelType::Dynamic && tun.server_names.is_empty() {
                 return Err(anyhow::anyhow!("隧道 {} 未绑定任何服务器", tun.name));
             }
+        }
+
+        // 主代理校验：至多一个，且必须是动态代理（SOCKS5）类型
+        let mut primary_count = 0;
+        for tun in &self.tunnels {
+            if tun.primary {
+                primary_count += 1;
+                if tun.tunnel_type != TunnelType::Dynamic {
+                    return Err(anyhow::anyhow!(
+                        "主代理必须是动态代理（SOCKS5）类型（隧道 {} 当前为 {:?}）",
+                        tun.name,
+                        tun.tunnel_type
+                    ));
+                }
+            }
+        }
+        if primary_count > 1 {
+            return Err(anyhow::anyhow!(
+                "最多只能有一个主代理（primary）隧道，当前有 {} 个",
+                primary_count
+            ));
         }
 
         // 跳板引用与循环检测（DFS）
@@ -227,21 +302,60 @@ impl Config {
             }
         }
 
-        // 监听端口冲突：同端口且 share_on_lan 相同的隧道
-        let mut seen: std::collections::HashMap<(u16, bool), &str> =
+        // 监听端口冲突：DNS 类隧道监听 UDP，其余监听 TCP；
+        // 仅同传输协议且同端口才算冲突（TCP 与 UDP 端口空间相互独立）
+        let mut seen: std::collections::HashMap<(u16, &'static str), &str> =
             std::collections::HashMap::new();
         for tun in &self.tunnels {
-            let key = (tun.port, tun.share_on_lan);
+            let proto = match tun.tunnel_type {
+                TunnelType::Dns | TunnelType::DnsDot | TunnelType::DnsDoh => "UDP",
+                _ => "TCP",
+            };
+            let key = (tun.port, proto);
             if let Some(other) = seen.insert(key, &tun.name) {
                 return Err(anyhow::anyhow!(
-                    "隧道 {} 与 {} 监听端口冲突 (端口 {} 且局域网共享设置相同)",
+                    "隧道 {} 与 {} 监听端口冲突 ({} 端口 {})",
                     tun.name,
                     other,
+                    proto,
                     tun.port
                 ));
             }
         }
         Ok(())
+    }
+
+    /// 返回显式标记为 primary 的主代理隧道（无则返回 None）
+    pub fn primary_tunnel(&self) -> Option<&TunnelConfig> {
+        self.tunnels.iter().find(|t| t.primary)
+    }
+
+    /// 确保存在主代理：
+    /// - 已有 primary 标记则不动
+    /// - 否则把第一个 Dynamic 隧道标记为主代理
+    /// - 没有任何 Dynamic 隧道则创建一个默认主代理（name: 主代理, port: 1080）
+    pub fn ensure_primary(&mut self) {
+        if self.tunnels.iter().any(|t| t.primary) {
+            return;
+        }
+        if let Some(tun) = self
+            .tunnels
+            .iter_mut()
+            .find(|t| t.tunnel_type == TunnelType::Dynamic)
+        {
+            tun.primary = true;
+            return;
+        }
+        self.tunnels.push(TunnelConfig {
+            name: "主代理".to_string(),
+            server_names: vec![],
+            tunnel_type: TunnelType::Dynamic,
+            port: 1080,
+            remote_addr: None,
+            share_on_lan: false,
+            primary: true,
+            strategy: TunnelStrategy::default(),
+        });
     }
 
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -263,6 +377,16 @@ impl Config {
             }
         }
 
+        // 旧配置迁移：无 primary 标记时，把第一个 Dynamic 隧道标记为主代理
+        if !config.tunnels.iter().any(|t| t.primary)
+            && let Some(tun) = config
+                .tunnels
+                .iter_mut()
+                .find(|t| t.tunnel_type == TunnelType::Dynamic)
+        {
+            tun.primary = true;
+        }
+
         Ok(config)
     }
 
@@ -281,8 +405,24 @@ impl Config {
         }
 
         let content = serde_yaml::to_string(&config_to_save)?;
-        fs::write(&path, content)
-            .with_context(|| format!("写入配置文件失败: {}", path.as_ref().display()))?;
+        // 原子写：先写同目录临时文件再 rename，
+        // 避免写入中途失败（断电/磁盘满）留下截断的半截配置。
+        // pid + 随机数保证多进程/多线程不会共用临时文件并互相截断
+        let path = path.as_ref();
+        let random_suffix = {
+            use rand::RngExt as _;
+            rand::rng().random::<u64>()
+        };
+        let tmp_path =
+            path.with_extension(format!("tmp.{}.{:016x}", std::process::id(), random_suffix));
+        if let Err(e) = fs::write(&tmp_path, &content) {
+            let _ = fs::remove_file(&tmp_path); // 清理残留临时文件
+            return Err(e).with_context(|| format!("写入临时配置文件失败: {}", tmp_path.display()));
+        }
+        if let Err(e) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| format!("重命名配置文件失败: {}", path.display()));
+        }
         Ok(())
     }
 }
@@ -318,6 +458,7 @@ mod tests {
             port,
             remote_addr: None,
             share_on_lan: share,
+            primary: false,
             strategy: TunnelStrategy::Failover,
         }
     }
@@ -355,6 +496,7 @@ mod tests {
 
     #[test]
     fn validate_detects_port_conflict_and_accepts_valid() {
+        // 同为 TCP 隧道（Dynamic）同端口：冲突
         let bad = Config {
             general: Default::default(),
             servers: vec![server("a", None)],
@@ -366,16 +508,210 @@ mod tests {
         };
         assert!(bad.validate().unwrap_err().to_string().contains("冲突"));
 
+        // 同为 UDP 的 DNS 类隧道同端口：冲突
+        let mut d1 = tunnel("d1", vec!["a"], 5353, false);
+        d1.tunnel_type = TunnelType::Dns;
+        let mut d2 = tunnel("d2", vec!["a"], 5353, true);
+        d2.tunnel_type = TunnelType::DnsDot;
+        let bad_udp = Config {
+            general: Default::default(),
+            servers: vec![server("a", None)],
+            tunnels: vec![d1, d2],
+            routing: Default::default(),
+        };
+        assert!(
+            bad_udp.validate().unwrap_err().to_string().contains("冲突"),
+            "DNS 类隧道同 UDP 端口必须判定冲突"
+        );
+
+        // 合法：不同端口；且 TCP 与 UDP 同端口不冲突（端口空间独立），
+        // share_on_lan 差异不再影响冲突判定
+        let mut dns = tunnel("dns1", vec!["a"], 1080, false);
+        dns.tunnel_type = TunnelType::DnsDoh;
         let ok = Config {
             general: Default::default(),
             servers: vec![server("a", None), server("b", Some("a"))],
             tunnels: vec![
                 tunnel("t1", vec!["a", "b"], 1080, false),
                 tunnel("t2", vec!["a"], 1081, true),
+                dns, // UDP 1080 与 t1 的 TCP 1080 不冲突
             ],
             routing: Default::default(),
         };
         ok.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_names() {
+        // 服务器名重复
+        let dup_srv = Config {
+            general: Default::default(),
+            servers: vec![server("a", None), server("a", None)],
+            tunnels: vec![],
+            routing: Default::default(),
+        };
+        assert!(
+            dup_srv.validate().unwrap_err().to_string().contains("重复"),
+            "服务器名重复必须报错"
+        );
+
+        // 隧道名重复
+        let dup_tun = Config {
+            general: Default::default(),
+            servers: vec![server("a", None)],
+            tunnels: vec![
+                tunnel("t1", vec!["a"], 1080, false),
+                tunnel("t1", vec!["a"], 1081, false),
+            ],
+            routing: Default::default(),
+        };
+        assert!(
+            dup_tun.validate().unwrap_err().to_string().contains("重复"),
+            "隧道名重复必须报错"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_dynamic_primary() {
+        let mut t = tunnel("t1", vec!["a"], 1080, false);
+        t.tunnel_type = TunnelType::Local;
+        t.remote_addr = Some("127.0.0.1:80".into());
+        t.primary = true;
+        let cfg = Config {
+            general: Default::default(),
+            servers: vec![server("a", None)],
+            tunnels: vec![t],
+            routing: Default::default(),
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("主代理必须是动态代理（SOCKS5）类型"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_rejects_multiple_primaries() {
+        let mut t1 = tunnel("t1", vec!["a"], 1080, false);
+        t1.primary = true;
+        let mut t2 = tunnel("t2", vec!["a"], 1081, false);
+        t2.primary = true;
+        let cfg = Config {
+            general: Default::default(),
+            servers: vec![server("a", None)],
+            tunnels: vec![t1, t2],
+            routing: Default::default(),
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("最多只能有一个主代理"), "{}", err);
+    }
+
+    #[test]
+    fn validate_accepts_single_dynamic_primary() {
+        let mut t1 = tunnel("t1", vec!["a"], 1080, false);
+        t1.primary = true;
+        let cfg = Config {
+            general: Default::default(),
+            servers: vec![server("a", None)],
+            tunnels: vec![t1, tunnel("t2", vec!["a"], 1081, false)],
+            routing: Default::default(),
+        };
+        cfg.validate().unwrap();
+        assert_eq!(cfg.primary_tunnel().map(|t| t.name.as_str()), Some("t1"));
+    }
+
+    #[test]
+    fn ensure_primary_marks_first_dynamic() {
+        let mut cfg = Config {
+            general: Default::default(),
+            servers: vec![server("a", None)],
+            tunnels: vec![
+                {
+                    let mut t = tunnel("t1", vec!["a"], 8080, false);
+                    t.tunnel_type = TunnelType::Local;
+                    t.remote_addr = Some("127.0.0.1:80".into());
+                    t
+                },
+                tunnel("t2", vec!["a"], 1080, false),
+            ],
+            routing: Default::default(),
+        };
+        assert!(cfg.primary_tunnel().is_none());
+        cfg.ensure_primary();
+        assert_eq!(cfg.primary_tunnel().map(|t| t.name.as_str()), Some("t2"));
+        // 幂等：再次调用不改变结果
+        cfg.ensure_primary();
+        assert_eq!(
+            cfg.tunnels.iter().filter(|t| t.primary).count(),
+            1,
+            "ensure_primary 必须幂等"
+        );
+    }
+
+    #[test]
+    fn ensure_primary_creates_default_when_no_dynamic() {
+        let mut cfg = Config {
+            general: Default::default(),
+            servers: vec![server("a", None)],
+            tunnels: vec![{
+                let mut t = tunnel("t1", vec!["a"], 8080, false);
+                t.tunnel_type = TunnelType::Local;
+                t.remote_addr = Some("127.0.0.1:80".into());
+                t
+            }],
+            routing: Default::default(),
+        };
+        cfg.ensure_primary();
+        let p = cfg.primary_tunnel().expect("应创建默认主代理");
+        assert_eq!(p.name, "主代理");
+        assert_eq!(p.port, 1080);
+        assert_eq!(p.tunnel_type, TunnelType::Dynamic);
+
+        // 空隧道列表同样创建默认主代理
+        let mut empty = Config {
+            general: Default::default(),
+            servers: vec![],
+            tunnels: vec![],
+            routing: Default::default(),
+        };
+        empty.ensure_primary();
+        assert_eq!(empty.primary_tunnel().map(|t| t.port), Some(1080));
+    }
+
+    #[test]
+    fn load_marks_first_dynamic_as_primary_for_legacy_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            r#"servers:
+  - name: a
+    host: example.com
+    port: 22
+    user: root
+    password: "p"
+tunnels:
+  - name: rule1
+    server_names: [a]
+    type: local
+    port: 8080
+    remote_addr: "127.0.0.1:80"
+  - name: rule2
+    server_names: [a]
+    type: dynamic
+    port: 1080
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_from_file(&path).unwrap();
+        assert_eq!(
+            cfg.primary_tunnel().map(|t| t.name.as_str()),
+            Some("rule2"),
+            "旧配置应自动把第一个 Dynamic 隧道标记为主代理"
+        );
+        assert!(!cfg.tunnels[0].primary, "非 Dynamic 隧道不得被标记");
     }
 
     #[test]
@@ -398,6 +734,103 @@ tunnels: []
 
         let err = Config::load_from_file(&path).unwrap_err();
         assert!(format!("{:#}", err).contains("解密服务器 broken 的密码失败"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_cidr_rule() {
+        // 非法 CIDR（掩码越界）必须报错并定位到具体规则，
+        // 不得静默降级为域名规则
+        let mut cfg = Config {
+            general: Default::default(),
+            servers: vec![server("a", None)],
+            tunnels: vec![],
+            routing: Default::default(),
+        };
+        cfg.routing.whitelist.push("10.0.0.0/33".to_string());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("10.0.0.0/33"), "{}", err);
+        assert!(err.contains("白名单"), "{}", err);
+
+        // 黑名单同样校验
+        cfg.routing.whitelist.clear();
+        cfg.routing.blacklist.push("192.168.0.0/40".to_string());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("黑名单"), "{}", err);
+
+        // 合法 CIDR 与域名规则不受影响
+        cfg.routing.blacklist.clear();
+        cfg.routing
+            .whitelist
+            .extend(["10.0.0.0/8".to_string(), "example.com".to_string()]);
+        cfg.validate().unwrap();
+    }
+
+    /// RoutingConfig 手工 Default 与 serde 逐字段缺省语义必须一致
+    #[test]
+    fn routing_default_matches_serde_defaults() {
+        let d = RoutingConfig::default();
+        assert_eq!(d.mode, RouteMode::Global, "缺省路由模式应为全局");
+        assert!(d.bypass_lan, "Rust Default 的 bypass_lan 应为 true");
+        assert!(d.whitelist.is_empty());
+        assert!(d.blacklist.is_empty());
+
+        // 整体缺省 routing 段：与手工 Default 完全一致
+        let cfg: Config = serde_yaml::from_str("servers: []\ntunnels: []\n").unwrap();
+        assert_eq!(cfg.routing, d, "缺省 routing 段应与 Default 一致");
+    }
+
+    /// routing 段只给 mode 时必须可加载（其余字段走 serde 缺省）
+    #[test]
+    fn routing_partial_fields_load_with_defaults() {
+        let cfg: Config =
+            serde_yaml::from_str("servers: []\ntunnels: []\nrouting:\n  mode: global\n").unwrap();
+        assert_eq!(cfg.routing.mode, RouteMode::Global);
+        assert!(cfg.routing.bypass_lan, "mode 之外字段应缺省为 true");
+        assert!(cfg.routing.whitelist.is_empty());
+        assert!(cfg.routing.blacklist.is_empty());
+    }
+
+    /// 多线程向同一路径保存时使用各自临时文件，最终文件必须是某一份完整配置
+    #[test]
+    fn concurrent_save_to_file_keeps_final_config_parseable() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("config.yaml"));
+        let workers = 16;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+
+        for i in 0..workers {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut config = Config {
+                    general: Default::default(),
+                    servers: vec![],
+                    tunnels: vec![],
+                    routing: Default::default(),
+                };
+                config.general.metrics_addr = Some(format!("127.0.0.1:{}", 20000 + i));
+                barrier.wait();
+                config.save_to_file(path.as_path())
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("保存线程不应 panic")
+                .expect("并发保存均应成功");
+        }
+
+        let saved = Config::load_from_file(path.as_path()).expect("最终配置必须完整可解析");
+        let marker = saved.general.metrics_addr.expect("应保留保存的标记");
+        assert!(
+            (0..workers).any(|i| marker == format!("127.0.0.1:{}", 20000 + i)),
+            "最终内容必须完整来自某一次保存，实际为 {}",
+            marker
+        );
     }
 
     #[test]

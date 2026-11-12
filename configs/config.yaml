@@ -1,12 +1,14 @@
 # OxiTun 配置文件示例 (Example Configuration)
 
 general:
-  auto_connect: false             # 是否在启动时自动连接代理
-  auto_startup: false             # 是否开机自启
-  auto_set_system_proxy: false    # 是否自动接管全局系统代理
-  pin_window: false               # 是否置顶窗口 (适用于桌面端)
-  chnroute_url: "https://cdn.jsdelivr.net/gh/misakaio/chnroutes2@master/chnroutes.txt" # 智能路由大陆 IP 列表更新地址
-  chnroute_update_interval_hours: 24.0 # 路由表自动更新间隔（小时）
+  # 以下五个字段仅 GUI 生效；CLI 不参与这些行为
+  auto_connect: false             # [GUI 专用] 是否在启动时自动连接代理
+  auto_startup: false             # [GUI 专用] 是否开机自启
+  auto_set_system_proxy: false    # [GUI 专用] 是否自动接管全局系统代理
+  pin_window: false               # [GUI 专用] 是否置顶窗口 (适用于桌面端)
+  chnroute_update_interval_hours: 24.0 # [GUI 专用] 路由表自动更新间隔（小时）
+  chnroute_url: "https://cdn.jsdelivr.net/gh/misakaio/chnroutes2@master/chnroutes.txt" # CLI/GUI 共用：智能路由大陆 IP 列表更新地址，不参与热加载，重启生效
+  # metrics_addr: "127.0.0.1:9090"  # 可选：Prometheus 指标监听地址（暴露 /metrics）；CLI/GUI 共用，不参与热加载，重启生效，不配置则不启动监听器
 
 servers:
   - name: "myserver"              # 服务器自定义名称
@@ -16,7 +18,7 @@ servers:
     
     # 认证配置
     auth_type: "password"         # 认证方式：'password' 或 'key'
-    password: "your_password"     # 登录密码（保存/运行后会被自动加密）
+    password: "your_password"     # 登录密码（CLI 只加载配置、不写回；仅 GUI 保存时会自动加密并写回）
     key_path: ""                  # 私钥路径（auth_type 为 key 时填写，支持 ~/ 前缀）
     encrypted: false              # 密码是否已被加密
     
@@ -33,16 +35,25 @@ servers:
 tunnels:
   - name: "SOCKS5 Proxy"          # 隧道名称
     server_names: ["myserver"]    # 该隧道绑定的服务器名称列表
-    type: "dynamic"               # 隧道类型：'dynamic' (SOCKS5 代理) 或 'local' (本地端口转发)
+    type: "dynamic"               # 隧道类型：'dynamic' (SOCKS5 代理)、'local' (本地端口转发)、'remote' (远程/反向端口转发)、'dns' / 'dns_dot' (DoT) / 'dns_doh' (DoH) (DNS 代理)
     port: 1080                    # 本地监听的端口
-    remote_addr: null             # 目标地址（仅 Local 模式需要，格式为 host:port，例如 "192.168.1.1:80"）
-    share_on_lan: false           # 是否允许局域网其他设备连接本机代理
+    remote_addr: null             # 目标地址（local 与 remote 模式必填，格式 host:port，例如 "192.168.1.1:80"；dns 系列可选，作为上游 DNS 地址）
+    # ⚠️ 安全警告：开启后代理将绑定全部网络接口（0.0.0.0 / [::]），且 SOCKS5 无任何认证——
+    # 在公网环境会形成开放代理，任何人都可以滥用你的节点。非可信局域网环境严禁开启！
+    share_on_lan: false           # 是否允许局域网其他设备连接本机代理（默认仅监听 127.0.0.1 与 [::1]，开启见上方警告）
+    # primary: true               # 可选：标记为主代理隧道（至多一个，且必须为 dynamic 类型；未标记时自动取第一个 dynamic）
+    # strategy: failover          # 可选：多节点策略，'failover' (按 server_names 顺序优先、故障切换) 或 'round_robin' (新连接在可用节点间轮询)，仅多 server_names 时有意义
 
 routing:
-  mode: "global"                  # 路由模式：'global' (全局), 'whitelist' (白名单/绕过大陆), 'blacklist' (黑名单/仅代理名单内), 'direct' (直连)
-  bypass_lan: true                # 是否绕过局域网/私有 IP 地址 (开启后将自动直连 localhost, 127.0.0.1, 192.168.x.x, 10.x.x.x 等内网地址)
-  whitelist:                      # 强制走代理的域名白名单
+  # 路由模式真值表（判断"是否走代理"）：
+  #   global    全部走代理（bypass_lan 开启时，局域网/大陆 IP 例外直连）
+  #   whitelist 仅名单内走代理，其余全部直连
+  #   blacklist 名单内直连，其余默认走代理（可叠加 bypass_lan 对局域网/大陆 IP 直连）
+  #   direct    全部直连，不走代理
+  mode: "global"                  # 路由模式：'global' / 'whitelist' / 'blacklist' / 'direct'（含义见上方真值表）
+  bypass_lan: true                # 目标为局域网 IP 字面量时直连（localhost 等域名请配合域名规则）
+  whitelist:                      # whitelist 模式下走代理的域名/IP 名单（仅名单内代理）
     - "google.com"
     - "youtube.com"
-  blacklist:                      # 强制直连的域名黑名单
+  blacklist:                      # blacklist 模式下直连的域名/IP 名单（名单内直连，其余默认代理）
     - "ads.example.com"

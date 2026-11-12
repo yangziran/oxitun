@@ -31,6 +31,17 @@ impl TargetAddr {
 /// 目前强制响应无需认证 (No Authentication Required)，并仅支持 `CONNECT` 代理命令。
 /// 成功后返回客户端期望连接的远程目标地址封装 `TargetAddr`。
 pub async fn handle_socks5_handshake(stream: &mut TcpStream) -> Result<TargetAddr> {
+    // 对握手阶段的读取施加 30 秒超时，防止客户端连接后长期不发送数据而占用资源
+    match tokio::time::timeout(std::time::Duration::from_secs(30), handshake_inner(stream)).await {
+        Ok(result) => result,
+        Err(_) => {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "SOCKS5 握手读取超时").into())
+        }
+    }
+}
+
+/// SOCKS5 握手认证与请求解析的具体实现（由公开入口统一包裹超时控制）
+async fn handshake_inner(stream: &mut TcpStream) -> Result<TargetAddr> {
     let mut buf = [0u8; 2];
     if let Err(e) = stream.read_exact(&mut buf).await {
         return Err(anyhow!("读取 SOCKS5 握手失败: {}", e));
@@ -42,6 +53,13 @@ pub async fn handle_socks5_handshake(stream: &mut TcpStream) -> Result<TargetAdd
     let n_methods = buf[1] as usize;
     let mut methods = vec![0u8; n_methods];
     stream.read_exact(&mut methods).await?;
+
+    // 客户端声明的方法列表必须包含无认证 (0x00)，空列表同样视为不支持；
+    // 否则回复 0xFF（无可接受的方法）并拒绝连接
+    if !methods.contains(&0x00) {
+        let _ = stream.write_all(&[0x05, 0xFF]).await;
+        return Err(anyhow!("客户端的认证方法列表不支持无认证 (0x00)"));
+    }
 
     // SOCKS5 响应：无需认证
     stream.write_all(&[0x05, 0x00]).await?;
@@ -66,6 +84,15 @@ pub async fn handle_socks5_handshake(stream: &mut TcpStream) -> Result<TargetAdd
             "不支持的 SOCKS 请求命令 (仅支持 CONNECT): {}",
             req_header[1]
         ));
+    }
+
+    // RSV 保留字节 (RFC 1928) 必须为 0x00，非零视为协议错误
+    if req_header[2] != 0x00 {
+        // 响应：general failure
+        let _ = stream
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        return Err(anyhow!("SOCKS 请求 RSV 保留字节非零: {}", req_header[2]));
     }
 
     let target = match req_header[3] {
@@ -112,26 +139,12 @@ pub async fn handle_socks5_handshake(stream: &mut TcpStream) -> Result<TargetAdd
 }
 
 /// 根据底层连接的建立状态，向 SOCKS5 客户端返回标准代理应答。
-/// 能够自动探测 IPv4 / IPv6 类型的 Socket 并返回对应的地址类型及 BND.ADDR 参数。
+/// BND.ADDR/BND.PORT 统一填 IPv4 全零 (0.0.0.0:0)：RFC 1928 并未强制要求
+/// 服务端在 CONNECT 成功应答中回填真实的绑定地址，许多主流实现均返回全零，
+/// 且入站连接的本地地址对客户端也没有实际意义。
 pub async fn send_socks5_reply(stream: &mut TcpStream, success: bool) -> Result<()> {
     let rep = if success { 0x00 } else { 0x01 };
 
-    // 检查连接流是基于 IPv4 还是 IPv6
-    if let Ok(local_addr) = stream.local_addr()
-        && local_addr.is_ipv6()
-    {
-        let mut reply = vec![0x05, rep, 0x00, 0x04];
-        let ip_bytes = match local_addr.ip() {
-            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
-            _ => vec![0u8; 16],
-        };
-        reply.extend_from_slice(&ip_bytes);
-        reply.extend_from_slice(&local_addr.port().to_be_bytes());
-        stream.write_all(&reply).await?;
-        return Ok(());
-    }
-
-    // 默认 IPv4 成功响应
     let reply = [0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     stream.write_all(&reply).await?;
     Ok(())
@@ -221,6 +234,43 @@ mod tests {
         let mut reply = [0u8; 10];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], 0x07, "不支持命令应应答 0x07");
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_nonzero_rsv_with_reply() {
+        let (mut client, mut server) = stream_pair().await;
+        let task = tokio::spawn(async move { handle_socks5_handshake(&mut server).await });
+        write_greeting(&mut client).await;
+        // CONNECT 请求但 RSV = 0x01（保留字节必须为 0x00）
+        client
+            .write_all(&[0x05, 0x01, 0x01, 0x01, 93, 184, 216, 34, 0x01, 0xBB])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x01, "RSV 非零应应答 0x01 (general failure)");
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_methods_without_no_auth() {
+        // 方法列表仅包含用户名/密码认证 (0x02)，不含无认证 (0x00)
+        let (mut client, mut server) = stream_pair().await;
+        let task = tokio::spawn(async move { handle_socks5_handshake(&mut server).await });
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0xFF], "不含 0x00 的方法列表应应答 0xFF");
+        assert!(task.await.unwrap().is_err());
+
+        // 空方法列表 (NMETHODS=0) 同样应被拒绝
+        let (mut client, mut server) = stream_pair().await;
+        let task = tokio::spawn(async move { handle_socks5_handshake(&mut server).await });
+        client.write_all(&[0x05, 0x00]).await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0xFF], "空方法列表应应答 0xFF");
         assert!(task.await.unwrap().is_err());
     }
 

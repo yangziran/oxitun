@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from "vue";
+import { ref, onMounted, onBeforeUnmount, computed, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -29,6 +29,7 @@ interface TunnelConfig {
   port: number;
   remote_addr?: string;
   share_on_lan: boolean;
+  primary: boolean;
   strategy?: "failover" | "round_robin";
 }
 
@@ -120,6 +121,48 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+// ===== 主代理卡片指标：活跃连接 / 上下行流量 / 运行时长 =====
+const proxyMetrics = ref<MetricsSnapshot | null>(null);
+const uptimeText = ref("0秒");
+let proxyStartTime: number | null = null;
+let proxyMetricsTimer: ReturnType<typeof setInterval> | null = null;
+
+function formatUptime(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}小时${m}分${s}秒`;
+  if (m > 0) return `${m}分${s}秒`;
+  return `${s}秒`;
+}
+
+async function refreshProxyMetrics() {
+  try {
+    proxyMetrics.value = await invoke<MetricsSnapshot>("get_metrics");
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+// 运行时每 1 秒更新运行时长、每 2 秒刷新一次指标；停止时归零并停表
+watch(isRunning, (running) => {
+  if (running) {
+    proxyStartTime = Date.now();
+    uptimeText.value = "0秒";
+    refreshProxyMetrics();
+    let tick = 0;
+    proxyMetricsTimer = setInterval(() => {
+      tick++;
+      if (proxyStartTime !== null) uptimeText.value = formatUptime(Date.now() - proxyStartTime);
+      if (tick % 2 === 0) refreshProxyMetrics();
+    }, 1000);
+  } else {
+    if (proxyMetricsTimer) { clearInterval(proxyMetricsTimer); proxyMetricsTimer = null; }
+    proxyStartTime = null;
+    proxyMetrics.value = null;
+    uptimeText.value = "0秒";
+  }
+});
+
 // 状态胶囊：区分过渡态与终态
 const statusClass = computed(() =>
   isStarting.value ? "transitioning" : (startError.value && !isRunning.value ? "error" : (isRunning.value ? "running" : "stopped"))
@@ -130,24 +173,122 @@ const statusText = computed(() =>
 const selectedServerIdx = ref(0);
 const advancedExpanded = ref(false);
 
+// 主代理与自定义规则按显式 primary 标记分离（不再依赖 tunnels[0] 位置约定）
+const primaryTunnel = computed(() => config.value.tunnels.find(t => t.primary));
+const customTunnels = computed(() =>
+  config.value.tunnels
+    .map((tun, idx) => ({ tun, idx }))
+    .filter(x => !x.tun.primary)
+);
+
+// ===== 系统状态页：主代理控制卡片 + 折叠配置 + 设置弹窗 =====
+// 主代理配置默认展开；自定义规则默认收起（空列表时显示引导卡片）
+const primaryConfigExpanded = ref(true);
+const customRulesExpanded = ref(false);
+const showSettings = ref(false);
+
+const proxyAddress = computed(() => {
+  const pt = primaryTunnel.value;
+  if (!pt || !pt.port) return "";
+  return `socks5://127.0.0.1:${pt.port}`;
+});
+const currentNodeName = computed(() => primaryTunnel.value?.server_names?.[0] ?? "");
+
+async function copyProxyAddress() {
+  const addr = proxyAddress.value;
+  if (!addr) return;
+  try {
+    await navigator.clipboard.writeText(addr);
+    toast("success", "代理地址已复制");
+  } catch (e) {
+    toast("error", "复制失败");
+  }
+}
+
+function openSettings() { showSettings.value = true; }
+function closeSettings() { showSettings.value = false; }
+
+function onGlobalKeydown(e: KeyboardEvent) {
+  if ((e.metaKey || e.ctrlKey) && e.key === ",") {
+    e.preventDefault();
+    showSettings.value = true;
+  } else if (e.key === "Escape" && showSettings.value) {
+    showSettings.value = false;
+  }
+}
+
+// 卸载时需要统一释放的资源：Tauri 事件监听 unlisten 函数、窗口聚焦监听、系统主题监听、定时器
+const unlisteners: Array<() => void> = [];
+
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onGlobalKeydown);
+  themeMedia.removeEventListener("change", onThemeMediaChange);
+  if (proxyMetricsTimer) { clearInterval(proxyMetricsTimer); proxyMetricsTimer = null; }
+  if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+  // 卸载时清空待确认队列，避免残留弹窗状态
+  pendingHostKeys.value = [];
+  for (const unlisten of unlisteners) unlisten();
+  unlisteners.length = 0;
+});
+
 // ===== 主机密钥首次确认（TOFU）=====
+// request_id 为后端为每次待确认请求生成的唯一标识：决策必须携带同一 request_id，
+// 旧弹窗在请求超时/被替换后提交会收到「已过期」，不会误批准后续请求
 interface PendingHostKey {
   host: string;
   port: number;
   key_type: string;
   fingerprint: string;
+  request_id: string;
 }
-const pendingHostKey = ref<PendingHostKey | null>(null);
+// 待确认队列：仅按 request_id 判重。同一 host:port 可能同时存在多条不同
+// request_id 的待确认（双 broker 并发场景，后端去重仅在单 broker 内成立），
+// 不可按 host:port 替换，否则先到的 request_id 永不被提交、SSH 握手挂起超时
+const pendingHostKeys = ref<PendingHostKey[]>([]);
+const resolvingHostKey = ref(false);
+// 已提交或已过期的请求可能因 Lagged 补拉/残留广播晚到，保留有界 ID 集合避免重复弹窗
+const resolvedHostKeyIds = new Set<string>();
+// 当前展示的待确认项（队首），模板沿用单值语义
+const pendingHostKey = computed(() => pendingHostKeys.value[0] ?? null);
+
+function enqueuePendingHostKey(p: PendingHostKey) {
+  // 仅按 request_id 判重，同一主机允许并存多条不同 request_id 的待确认
+  if (resolvedHostKeyIds.has(p.request_id)) return;
+  if (pendingHostKeys.value.some(x => x.request_id === p.request_id)) return;
+  pendingHostKeys.value.push(p);
+}
+
+function finishPendingHostKey(requestId: string) {
+  resolvedHostKeyIds.add(requestId);
+  if (resolvedHostKeyIds.size > 256) {
+    const oldest = resolvedHostKeyIds.values().next();
+    if (!oldest.done) resolvedHostKeyIds.delete(oldest.value);
+  }
+  pendingHostKeys.value = pendingHostKeys.value.filter(x => x.request_id !== requestId);
+}
 
 async function resolveHostKey(accept: boolean) {
-  const pending = pendingHostKey.value;
-  if (!pending) return;
+  if (resolvingHostKey.value) return;
+  resolvingHostKey.value = true;
+  // 决策期间保留捕获的队首，避免快速连续点击把下一次决策提交给未核对的请求
+  const pending = pendingHostKeys.value[0];
   try {
-    await invoke("resolve_host_key", { host: pending.host, port: pending.port, accept });
+    if (!pending) return;
+    // 决策身份为 request_id：精确对回本次待确认请求
+    await invoke("resolve_host_key", { requestId: pending.request_id, accept });
+    finishPendingHostKey(pending.request_id);
   } catch (e) {
-    // 确认已过期等情况：直接关闭弹窗
+    const message = String(e);
+    if (message.includes("已过期")) {
+      if (pending) finishPendingHostKey(pending.request_id);
+      toast("info", message);
+    } else {
+      // 其他错误保留当前弹窗，允许用户核对后重试
+      toast("error", `提交主机密钥决策失败: ${message}`);
+    }
+  } finally {
+    resolvingHostKey.value = false;
   }
-  pendingHostKey.value = null;
 }
 
 
@@ -174,6 +315,8 @@ const blacklistText = computed({
 });
 
 onMounted(async () => {
+  initTheme();
+  window.addEventListener("keydown", onGlobalKeydown);
   try {
     await loadConfig();
     isRunning.value = await invoke("get_running_state");
@@ -186,34 +329,47 @@ onMounted(async () => {
       await getCurrentWindow().setAlwaysOnTop(!!config.value.general.pin_window);
     } catch(e) {}
     
-    listen('state-changed', async () => {
+    // listen 返回 unlisten 函数，全部登记以便卸载时释放
+    unlisteners.push(await listen('state-changed', async () => {
       try {
         await loadConfig();
         isRunning.value = await invoke("get_running_state");
       } catch(e) {}
-    });
-    listen<string>('config-save-error', (event) => {
+    }));
+    unlisteners.push(await listen<string>('config-save-error', (event) => {
       toast("error", event.payload);
-    });
+    }));
+    // 原生菜单/托盘「偏好设置」事件：打开设置弹窗
+    unlisteners.push(await listen('open-preferences', () => {
+      openSettings();
+    }));
+    // 系统代理接管/还原失败提示（payload 为错误信息字符串）
+    unlisteners.push(await listen<string>('sysproxy-error', (event) => {
+      toast("error", event.payload);
+    }));
 
-    // 主机密钥首次确认事件（后端发起，弹模态等待用户决策）
-    listen<PendingHostKey>('host-key-verify', (event) => {
-      pendingHostKey.value = event.payload;
-    });
+    // 主机密钥首次确认事件（后端发起，弹模态等待用户决策；入队保留所有待确认项）
+    unlisteners.push(await listen<PendingHostKey>('host-key-verify', (event) => {
+      enqueuePendingHostKey(event.payload);
+    }));
     // 窗口刚打开时补拉待确认请求（事件可能先于监听注册发出）
     try {
       const pendings = await invoke<PendingHostKey[]>("get_pending_host_keys");
-      if (pendings.length > 0) pendingHostKey.value = pendings[0];
+      pendings.forEach(enqueuePendingHostKey);
     } catch(e) {}
+    // 托盘修改节点/模式后重启失败等后端异步错误提示
+    unlisteners.push(await listen<string>('start-error', (event) => {
+      toast("error", event.payload);
+    }));
     
-    getCurrentWindow().onFocusChanged(async ({ payload: focused }) => {
+    unlisteners.push(await getCurrentWindow().onFocusChanged(async ({ payload: focused }) => {
       if (focused) {
         try {
           await loadConfig();
           isRunning.value = await invoke("get_running_state");
         } catch(e) {}
       }
-    });
+    }));
   } catch (e: any) {
     toast("error", `初始化错误: ${String(e)}`);
   }
@@ -229,8 +385,9 @@ async function loadConfig() {
       if (srv.timeout_seconds === undefined) srv.timeout_seconds = 15;
     }
     
-    if (res.tunnels && res.tunnels.length > 0 && res.tunnels[0].server_names && res.tunnels[0].server_names.length === 0 && res.servers && res.servers.length > 0) {
-      res.tunnels[0].server_names = [res.servers[0].name];
+    const pt = res.tunnels.find(t => t.primary);
+    if (pt && pt.server_names && pt.server_names.length === 0 && res.servers && res.servers.length > 0) {
+      pt.server_names = [res.servers[0].name];
     }
     config.value = res;
   } catch (e) {
@@ -260,29 +417,64 @@ function validateConfig(): string | null {
   return null;
 }
 
-async function saveConfig() {
+async function saveConfig(): Promise<boolean> {
   const err = validateConfig();
-  if (err) { toast("error", err); return; }
+  if (err) { toast("error", err); return false; }
   try {
     await invoke("save_config", { newConfig: config.value });
     toast("success", "配置已保存");
+    return true;
   } catch (e) {
     toast("error", `保存失败: ${e}`);
+    return false;
   }
 }
 
 async function toggleAutostart() {
+  if (!await saveConfig()) return;
   if (config.value.general.auto_startup) {
     await enable();
   } else {
     await disable();
   }
-  await saveConfig();
 }
 
 async function togglePin() {
-  await saveConfig();
+  if (!await saveConfig()) return;
   await getCurrentWindow().setAlwaysOnTop(!!config.value.general.pin_window);
+}
+
+// ===== 深色/浅色主题切换（持久化到 localStorage，未手动选择时跟随系统）=====
+const theme = ref<"light" | "dark">("light");
+const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
+
+function applyTheme(t: "light" | "dark") {
+  theme.value = t;
+  document.documentElement.setAttribute("data-theme", t);
+}
+
+// 具名处理函数，便于卸载时 removeEventListener
+function onThemeMediaChange(e: MediaQueryListEvent) {
+  // 用户未手动选择过时跟随系统主题
+  if (!localStorage.getItem("oxitun-theme")) {
+    applyTheme(e.matches ? "dark" : "light");
+  }
+}
+
+function initTheme() {
+  const saved = localStorage.getItem("oxitun-theme");
+  if (saved === "light" || saved === "dark") {
+    applyTheme(saved);
+  } else {
+    applyTheme(themeMedia.matches ? "dark" : "light");
+  }
+  themeMedia.addEventListener("change", onThemeMediaChange);
+}
+
+function toggleTheme() {
+  const next = theme.value === "dark" ? "light" : "dark";
+  applyTheme(next);
+  localStorage.setItem("oxitun-theme", next);
 }
 
 function isHostKeyChangedError(message: string): boolean {
@@ -330,16 +522,17 @@ async function toggleProxy() {
         }
         if (config.value.tunnels.length === 0) {
           config.value.tunnels.push({
-            name: "SOCKS5 代理",
+            name: "主代理",
             server_names: [config.value.servers[0].name],
             type: "dynamic",
-            port: 10808,
-            share_on_lan: false
+            port: 1080,
+            share_on_lan: false,
+            primary: true
           });
-          await saveConfig();
+          if (!await saveConfig()) return;
         }
 
-        const firstServerName = config.value.tunnels[0]?.server_names[0];
+        const firstServerName = (primaryTunnel.value ?? config.value.tunnels[0])?.server_names[0];
         firstServer = config.value.servers.find(s => s.name === firstServerName) ?? config.value.servers[0];
         await invoke("start_tunnels");
         isRunning.value = true;
@@ -363,10 +556,30 @@ function addTunnel() {
   config.value.tunnels.push({
     name: `新监听器 ${n}`,
     server_names: [config.value.servers.length > 0 ? config.value.servers[0].name : ""],
-    type: "local",
+    type: "dynamic",
     port: 8080,
     remote_addr: "127.0.0.1:80",
-    share_on_lan: false
+    share_on_lan: false,
+    primary: false
+  });
+  saveConfig();
+}
+
+// 空态引导卡片 CTA：展开自定义规则区域并新增一条规则
+function addTunnelAndExpand() {
+  customRulesExpanded.value = true;
+  addTunnel();
+}
+
+// 异常状态（无 primary 隧道）下由用户显式创建主代理
+function createPrimaryTunnel() {
+  config.value.tunnels.push({
+    name: "主代理",
+    server_names: [config.value.servers.length > 0 ? config.value.servers[0].name : ""],
+    type: "dynamic",
+    port: 1080,
+    share_on_lan: false,
+    primary: true
   });
   saveConfig();
 }
@@ -387,7 +600,7 @@ async function testConnection(serverName: string) {
   isTesting.value = true;
   toast("info", "正在测试连接...");
   try {
-    await saveConfig();
+    if (!await saveConfig()) return;
     const result = await invoke<string>("test_ssh_connection", { serverName });
     lastTestResult.value = { server: serverName, ok: true, text: String(result) };
     toast("success", String(result));
@@ -427,7 +640,7 @@ async function removeServer(index: number) {
 
 <template>
   <div class="mac-window">
-    <div class="toolbar">
+    <div class="toolbar" data-tauri-drag-region>
       <div class="tab" :class="{ active: currentTab === 'general' }" @click="currentTab = 'general'">
         <span>系统状态</span>
       </div>
@@ -440,113 +653,124 @@ async function removeServer(index: number) {
       <div class="tab" :class="{ active: currentTab === 'diagnostics' }" @click="currentTab = 'diagnostics'">
         <span>诊断</span>
       </div>
+      <button class="toolbar-settings-btn" @click="openSettings" title="偏好设置 (⌘,)">⚙️</button>
     </div>
     <div class="content" :class="{ 'no-padding': currentTab === 'servers' }">
       <!-- General Tab -->
       <div v-show="currentTab === 'general'" class="tab-pane">
-        
-        <div class="settings-group mac-list-group">
-          <h3 class="group-title">基础设置</h3>
-          
-          <div class="mac-row">
-            <label>当前状态</label>
-            <div class="control" style="justify-content: space-between; width: 100%;">
-              <span class="status-pill" :class="statusClass">
-                <span class="status-dot"></span>{{ statusText }}
-              </span>
-              <button :class="isRunning ? '' : 'primary-btn'" @click="toggleProxy" :disabled="isStarting" style="padding: 4px 12px; font-size: 12px;">
-                {{ isStarting ? "..." : (isRunning ? "停止代理" : "开启主代理") }}
-              </button>
-            </div>
-          </div>
-          <div v-if="startError && !isRunning" class="mac-row">
-            <label></label>
-            <div class="control" style="color: var(--danger); font-size: 12px; gap: 12px;">
-              <span>{{ startError }}</span>
-              <button v-if="hostKeyChangedTarget" @click="recoverChangedHostKey" :disabled="isStarting" style="flex-shrink: 0; padding: 4px 10px; font-size: 12px;">清除旧信任并重新连接</button>
-            </div>
-          </div>
-          
-          <div class="mac-row">
-            <label>开机时自动启动</label>
-            <div class="control" style="justify-content: flex-end;">
-              <input type="checkbox" v-model="config.general.auto_startup" @change="toggleAutostart" />
-            </div>
-          </div>
 
-          <div class="mac-row">
-            <label>自动启动主代理</label>
-            <div class="control" style="justify-content: flex-end;">
-              <input type="checkbox" v-model="config.general.auto_connect" @change="saveConfig" />
-            </div>
+        <!-- 主代理控制卡片（视觉焦点） -->
+        <div class="proxy-control-card">
+          <div class="proxy-control-main">
+            <span class="status-pill" :class="statusClass">
+              <span class="status-dot"></span>{{ statusText }}
+            </span>
+            <button class="proxy-toggle-btn" :class="isRunning ? '' : 'primary-btn'" @click="toggleProxy" :disabled="isStarting">
+              {{ isStarting ? "处理中…" : (isRunning ? "停止代理" : "开启主代理") }}
+            </button>
           </div>
-
-          <div class="mac-row">
-            <label>接管系统代理</label>
-            <div class="control" style="justify-content: space-between; gap: 12px;">
-              <span style="font-size: 11px; color: var(--muted);">开启主代理时自动设置系统 SOCKS5 代理，停止后自动还原</span>
-              <input type="checkbox" v-model="config.general.auto_set_system_proxy" @change="saveConfig" style="flex-shrink: 0;" />
-            </div>
+          <div v-if="startError && !isRunning" class="proxy-error">
+            <span>{{ startError }}</span>
+            <button v-if="hostKeyChangedTarget" @click="recoverChangedHostKey" :disabled="isStarting" class="copy-btn" style="color: var(--danger); border-color: var(--danger);">清除旧信任并重新连接</button>
           </div>
-
-          <div class="mac-row">
-            <label>保持窗口置顶</label>
-            <div class="control" style="justify-content: flex-end;">
-              <input type="checkbox" v-model="config.general.pin_window" @change="togglePin" />
+          <template v-if="primaryTunnel">
+            <div class="proxy-addr-row">
+              <code class="proxy-addr">{{ proxyAddress }}</code>
+              <button class="copy-btn" @click="copyProxyAddress" title="复制代理地址">复制</button>
+            </div>
+            <div v-if="currentNodeName" class="proxy-node">当前节点: {{ currentNodeName }}</div>
+          </template>
+          <div v-else class="proxy-node" style="display: flex; align-items: center; gap: 12px;">
+            <span>未配置主代理</span>
+            <button class="copy-btn" @click="createPrimaryTunnel">创建主代理</button>
+          </div>
+          <!-- 运行时指标行：活跃连接 / 上下行流量 / 运行时长 -->
+          <div v-if="isRunning" class="proxy-metrics-row">
+            <div class="proxy-metric">
+              <span class="proxy-metric-value">{{ proxyMetrics?.active_connections ?? 0 }}</span>
+              <span class="proxy-metric-label">活跃连接</span>
+            </div>
+            <div class="proxy-metric">
+              <span class="proxy-metric-value">↑ {{ formatBytes(proxyMetrics?.bytes_tx ?? 0) }}</span>
+              <span class="proxy-metric-label">上行流量</span>
+            </div>
+            <div class="proxy-metric">
+              <span class="proxy-metric-value">↓ {{ formatBytes(proxyMetrics?.bytes_rx ?? 0) }}</span>
+              <span class="proxy-metric-label">下行流量</span>
+            </div>
+            <div class="proxy-metric">
+              <span class="proxy-metric-value">{{ uptimeText }}</span>
+              <span class="proxy-metric-label">运行时长</span>
             </div>
           </div>
         </div>
 
-        <div class="settings-group mac-list-group" v-if="config.tunnels.length > 0">
-          <h3 class="group-title">主代理</h3>
-          
-          <div class="mac-row" style="border-bottom: none; padding-bottom: 0; padding-top: 8px;">
-            <div class="control" style="width: 100%; display: flex; gap: 8px; align-items: center; justify-content: center;">
-              <select v-model="config.tunnels[0].type" @change="saveConfig" style="width: 120px; flex-shrink: 0; text-align: center;">
-                <option value="dynamic">动态代理 (SOCKS5)</option>
-                <option value="local">本地端口转发 (Local)</option>
-                <option value="remote">远程反向转发 (Remote)</option>
-                <option value="dns">DNS 代理 (UDP 转 TCP)</option>
-                <option value="dns_dot">DNS 代理 (DoT)</option>
-                <option value="dns_doh">DNS 代理 (DoH)</option>
-              </select>
-              
-              <select :key="config.tunnels[0].server_names[0]" v-model="config.tunnels[0].server_names[0]" @change="saveConfig" style="width: 200px; flex-shrink: 0;">
-                <option v-for="srv in config.servers" :key="srv.name" :value="srv.name">{{ srv.name }}</option>
-              </select>
-              
-              <span style="font-weight: 500;">:</span>
-              
-              <input type="number" v-model.number="config.tunnels[0].port" placeholder="1080" @blur="saveConfig" style="width: 70px; flex-shrink: 0; text-align: center;" />
-            </div>
+        <!-- 主代理配置（折叠面板，默认收起） -->
+        <div class="settings-group mac-list-group" style="padding: 12px 20px;">
+          <div class="collapsible-header" @click="primaryConfigExpanded = !primaryConfigExpanded">
+            <h3 class="group-title" style="margin: 0; border: none; padding: 0;">主代理配置</h3>
+            <span class="collapsible-arrow">{{ primaryConfigExpanded ? '▲ 收起' : '▼ 展开' }}</span>
           </div>
-          
-          <div class="mac-row" v-if="['local', 'remote', 'dns', 'dns_dot', 'dns_doh'].includes(config.tunnels[0].type)" style="border-bottom: none; padding-top: 12px; padding-bottom: 8px;">
-            <div class="control" style="width: 100%; display: flex; gap: 8px; align-items: center; justify-content: center;">
-              <span style="font-size: 13px; color: var(--text); white-space: nowrap;">{{ ['dns', 'dns_dot', 'dns_doh'].includes(config.tunnels[0].type) ? '上游 DNS:' : '目标地址:' }}</span>
-              <input v-model="config.tunnels[0].remote_addr" placeholder="例如: 192.168.1.1:80" @blur="saveConfig" style="width: 200px; text-align: center;" />
-            </div>
-          </div>
-          
-          <div class="mac-row" style="padding-top: 8px; padding-bottom: 8px;">
-            <div class="control" style="justify-content: center; gap: 8px; width: 100%; align-items: center;">
-              <input type="checkbox" v-model="config.tunnels[0].share_on_lan" @change="saveConfig" style="margin: 0;" />
-              <span style="font-size: 13px; color: var(--text);">允许局域网连接</span>
+
+          <div v-show="primaryConfigExpanded" class="collapsible-content">
+            <template v-if="primaryTunnel">
+              <div class="mac-row" style="border-bottom: none; padding-bottom: 0; padding-top: 8px;">
+                <div class="control" style="width: 100%; display: flex; gap: 8px; align-items: center; justify-content: center;">
+                  <span style="width: 120px; flex-shrink: 0; text-align: center; font-size: 13px; color: var(--text);">SOCKS5 动态代理</span>
+
+                  <select :key="primaryTunnel.server_names[0]" v-model="primaryTunnel.server_names[0]" @change="saveConfig" style="width: 200px; flex-shrink: 0;">
+                    <option v-for="srv in config.servers" :key="srv.name" :value="srv.name">{{ srv.name }}</option>
+                  </select>
+
+                  <span style="font-weight: 500;">:</span>
+
+                  <input type="number" v-model.number="primaryTunnel.port" placeholder="1080" @blur="saveConfig" style="width: 70px; flex-shrink: 0; text-align: center;" />
+                </div>
+              </div>
+
+              <div class="mac-row" style="padding-top: 8px; padding-bottom: 8px;">
+                <div class="control" style="justify-content: center; gap: 8px; width: 100%; align-items: center;">
+                  <input type="checkbox" v-model="primaryTunnel.share_on_lan" @change="saveConfig" style="margin: 0;" />
+                  <span style="font-size: 13px; color: var(--text);">允许局域网连接</span>
+                </div>
+              </div>
+            </template>
+            <div v-else class="mac-row" style="border-bottom: none; padding-top: 8px; padding-bottom: 8px;">
+              <div class="control" style="justify-content: center; gap: 12px; width: 100%; align-items: center;">
+                <span style="font-size: 13px; color: var(--muted);">未配置主代理</span>
+                <button class="primary-btn" @click="createPrimaryTunnel" style="padding: 4px 12px; font-size: 12px;">创建主代理</button>
+              </div>
             </div>
           </div>
         </div>
 
         <div class="settings-group mac-list-group" style="padding-bottom: 8px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <div class="collapsible-header" @click="customRulesExpanded = !customRulesExpanded">
             <h3 class="group-title" style="margin: 0; border: none; padding: 0;">自定义规则</h3>
-            <button class="add-btn" @click="addTunnel" style="padding: 4px 8px; font-size: 12px;">＋ 添加规则</button>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <button v-if="customTunnels.length > 0" class="add-btn" @click.stop="addTunnel" style="padding: 4px 8px; font-size: 12px;">＋ 添加规则</button>
+              <span class="collapsible-arrow">{{ customRulesExpanded ? '▲ 收起' : '▼ 展开' }}</span>
+            </div>
           </div>
-          
+
+          <!-- 空列表：仅展开时显示引导卡片 -->
+          <div v-if="customTunnels.length === 0 && customRulesExpanded" class="empty-hero">
+            <div class="hero-icon">🔀</div>
+            <div class="hero-title">暂无自定义规则</div>
+            <div class="hero-desc">除主代理外，还可以为不同用途添加独立的端口转发或 DNS 代理规则。</div>
+            <button class="hero-cta" @click.stop="addTunnelAndExpand">＋ 添加规则</button>
+          </div>
+
+          <!-- 空列表收起时显示摘要 -->
+          <div v-else-if="customTunnels.length === 0 && !customRulesExpanded" style="padding: 16px; text-align: center; color: var(--muted); font-size: 12px;">
+            暂无自定义规则，点击「展开」添加
+          </div>
+
+          <div v-show="customRulesExpanded && customTunnels.length > 0" class="collapsible-content">
           <div class="tunnel-list" style="gap: 16px;">
-            <template v-for="(tun, idx) in config.tunnels" :key="idx">
-              <div v-if="idx > 0" class="tunnel-card" style="background: var(--surface-soft); padding: 12px 16px; border-radius: 8px; border: 1px solid var(--border-soft);">
+            <div v-for="{ tun, idx } in customTunnels" :key="idx" class="tunnel-card" style="background: var(--surface-soft); padding: 12px 16px; border-radius: 8px; border: 1px solid var(--border-soft);">
                 <div style="display: flex; justify-content: space-between; margin-bottom: 12px; border-bottom: 1px solid var(--border-soft); padding-bottom: 8px;">
-                  <div style="font-weight: 600; font-size: 13px; color: var(--text);">扩展规则 {{ idx }}</div>
+                  <div style="font-weight: 600; font-size: 13px; color: var(--text);">{{ tun.name }}</div>
                   <button class="icon-btn" @click="removeTunnel(idx)" style="color: var(--danger); background: none; border: none; cursor: pointer; padding: 0; font-size: 12px;">删除规则</button>
                 </div>
                 
@@ -586,12 +810,6 @@ async function removeServer(index: number) {
                   </div>
                 </div>
               </div>
-            </template>
-            <div v-if="config.tunnels.length <= 1" class="empty-hero">
-              <div class="hero-icon">🔀</div>
-              <div class="hero-title">暂无自定义规则</div>
-              <div class="hero-desc">除主代理外，还可以为不同用途添加独立的端口转发或 DNS 代理规则。</div>
-              <button class="hero-cta" @click="addTunnel">＋ 添加规则</button>
             </div>
           </div>
         </div>
@@ -736,8 +954,8 @@ async function removeServer(index: number) {
         </div>
       </div>
 
-      <!-- Routing Tab -->
-      <div v-show="currentTab === 'routing'" class="tab-pane">
+      <!-- Routing Tab：整体不滚动，规则列表撑满剩余高度 -->
+      <div v-show="currentTab === 'routing'" class="tab-pane routing-pane">
         
         
         <div class="settings-group">
@@ -786,8 +1004,8 @@ async function removeServer(index: number) {
         </div>
       </div>
 
-      <!-- 诊断页 -->
-      <div v-show="currentTab === 'diagnostics'" class="tab-pane">
+      <!-- 诊断页：整体不滚动，日志面板内部滚动撑满剩余高度 -->
+      <div v-show="currentTab === 'diagnostics'" class="tab-pane diag-pane">
         <!-- 最近一次连接测试结果（持久展示） -->
         <div v-if="lastTestResult" class="settings-group" :style="{ borderLeft: '3px solid ' + (lastTestResult.ok ? 'var(--success)' : 'var(--danger)') }">
           <div style="font-size: 13px; color: var(--text);">
@@ -808,9 +1026,9 @@ async function removeServer(index: number) {
           <div v-else class="empty-state" style="padding: 16px;">暂无指标</div>
         </div>
 
-        <!-- 日志面板 -->
-        <div class="settings-group" style="flex: 1; min-height: 200px;">
-          <h3 class="group-title" style="display: flex; justify-content: space-between; align-items: center;">
+        <!-- 日志面板：占据剩余高度，标题栏固定，内容内部滚动 -->
+        <div class="settings-group diag-log-group">
+          <h3 class="group-title" style="display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;">
             运行日志
             <button style="font-size: 12px; padding: 2px 10px;" @click="clearDiagLogs" :disabled="diagLogs.length === 0">清空</button>
           </h3>
@@ -841,8 +1059,8 @@ async function removeServer(index: number) {
           <div class="hk-row"><span>SHA256 指纹</span><code class="hk-fp">{{ pendingHostKey.fingerprint }}</code></div>
         </div>
         <div class="hk-actions">
-          <button class="hk-btn hk-reject" @click="resolveHostKey(false)">拒绝连接</button>
-          <button class="hk-btn hk-trust" @click="resolveHostKey(true)">信任并连接</button>
+          <button class="hk-btn hk-reject" :disabled="resolvingHostKey" @click="resolveHostKey(false)">拒绝连接</button>
+          <button class="hk-btn hk-trust" :disabled="resolvingHostKey" @click="resolveHostKey(true)">信任并连接</button>
         </div>
       </div>
     </div>
@@ -854,6 +1072,56 @@ async function removeServer(index: number) {
         <div class="hk-actions">
           <button class="hk-btn" @click="answerConfirm(false)">取消</button>
           <button class="hk-btn" style="color: var(--danger); border-color: var(--danger);" @click="answerConfirm(true)">确认删除</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 偏好设置弹窗（⚙️ 按钮或 Cmd/Ctrl+, 打开，Escape 关闭） -->
+    <div v-if="showSettings" class="settings-modal-overlay" role="dialog" aria-modal="true" aria-label="偏好设置" @click.self="closeSettings">
+      <div class="settings-modal">
+        <div class="settings-modal-header">
+          <h2>偏好设置</h2>
+          <button class="settings-close-btn" @click="closeSettings" title="关闭 (Esc)">×</button>
+        </div>
+        <div class="settings-modal-body">
+          <div class="mac-row">
+            <label>开机时自动启动</label>
+            <div class="control" style="justify-content: flex-end;">
+              <input type="checkbox" v-model="config.general.auto_startup" @change="toggleAutostart" />
+            </div>
+          </div>
+
+          <div class="mac-row">
+            <label>自动启动主代理</label>
+            <div class="control" style="justify-content: flex-end;">
+              <input type="checkbox" v-model="config.general.auto_connect" @change="saveConfig" />
+            </div>
+          </div>
+
+          <div class="mac-row">
+            <label>接管系统代理</label>
+            <div class="control" style="justify-content: space-between; gap: 12px;">
+              <span style="font-size: 11px; color: var(--muted);">开启主代理时自动设置系统 SOCKS5 代理，停止后自动还原</span>
+              <input type="checkbox" v-model="config.general.auto_set_system_proxy" @change="saveConfig" style="flex-shrink: 0;" />
+            </div>
+          </div>
+
+          <div class="mac-row">
+            <label>保持窗口置顶</label>
+            <div class="control" style="justify-content: flex-end;">
+              <input type="checkbox" v-model="config.general.pin_window" @change="togglePin" />
+            </div>
+          </div>
+
+          <div class="mac-row" style="border-bottom: none;">
+            <label>深色模式</label>
+            <div class="control" style="justify-content: flex-end;">
+              <input type="checkbox" :checked="theme === 'dark'" @change="toggleTheme" />
+            </div>
+          </div>
+        </div>
+        <div class="settings-modal-footer">
+          <button class="primary-btn" @click="closeSettings">完成</button>
         </div>
       </div>
     </div>

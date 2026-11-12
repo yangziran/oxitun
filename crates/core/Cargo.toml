@@ -8,6 +8,7 @@ aes-gcm = "0.11.1"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 dirs = "6.0.0"
+fs2 = "0.4.3"
 hickory-proto = "0.26.1"
 hickory-resolver = "0.26.1"
 hickory-server = "0.26.1"
@@ -19,12 +20,14 @@ reqwest = "0.13.4"
 russh = "0.63.1"
 russh-keys = "0.49.2"
 rustls = "0.23.43"
+same-file = "1.0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-rustls = "0.26.4"
+tokio-util = { version = "0.7.19", features = ["rt"] }
 webpki-roots = "1.0.9"
 
 [target.'cfg(windows)'.dependencies]
@@ -32,4 +35,7 @@ winreg = "0.56.0"
 
 [dev-dependencies]
 tempfile = "3.20.0"
+# metrics.rs 测试使用 #[tokio::test(start_paused = true)]，需 test-util feature
+# （tokio 的 full feature 不包含它）；仅测试构建生效
+tokio = { version = "1.53.1", features = ["test-util"] }
 
